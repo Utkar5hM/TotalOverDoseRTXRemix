@@ -1,0 +1,279 @@
+[20:40:52.003] info:  Game: TOD.exe
+[20:40:52.003] info:  DXVK_Remix: remix-1.4.2+cfb6edc9
+[20:40:52.003] info:  System Information Report:
+[20:40:52.003] info:    CPU: (AuthenticAMD) AMD Ryzen 5 9600X 6-Core Processor             
+[20:40:52.003] info:    Memory: 12.96 GiB / 31.10 GiB physical, 19.59 GiB / 40.60 GiB committed, 4.82 GiB / 128.00 TiB virtual (current process)
+[20:40:52.003] info:    OS: Windows 10.0 Build 26200
+[20:40:52.003] info:  Initializing RtxOptions...
+[20:40:52.003] info:  Initializing RtxOption system layers...
+[20:40:52.003] info:  Attempting to parse option layer: dxvk.conf...
+[20:40:52.004] info:  Found config file: dxvk.conf
+[20:40:52.004] info:  Parsed config file.
+[20:40:52.008] info:  Did not find app config for executable: C:\GOG Games\Total Overdose\TOD.exe
+[20:40:52.008] info:  Attempting to parse option layer: rtx.conf...
+[20:40:52.008] info:  Found config file: rtx.conf
+[20:40:52.008] info:  Parsed config file.
+[20:40:52.008] info:  Effective Combined Config for DXVK Options configuration:
+[20:40:52.008] info:    rtx.autoExposure.enabled = False
+[20:40:52.008] info:    rtx.enableRaytracing = True
+[20:40:52.008] info:    d3d9.evictManagedOnUnlock = True
+[20:40:52.008] info:    rtx.graphicsPreset = 0
+[20:40:52.008] info:    rtx.skyAutoDetect = 2
+[20:40:52.008] info:    rtx.raytracedRenderTarget.enable = True
+[20:40:52.008] info:    rtx.postfx.enable = False
+[20:40:52.008] info:    rtx.raytracedRenderTargetTextures = 0x1E604227861E0BCB, 0x261F0A146E18E6FA, 0x4E44041F9E27548B, 0x4E44041F9E27548E, 0x572A88A0A2E43086, 0x609466F92E702865, 0xB566CD7C690A3630, 0xD824D823D9CCF030, 0xF885C65160789A8B
+[20:40:52.008] info:    rtx.uiTextures = 0x1D1D8E3DB8CE7310, 0xDDF1BE54CD1936C8, 0xF8A7EB3A1A6FE3FB, 0xA46C307BB6FFCB19, 0xD84E0241FB4E93F6, 0x6D903948AD06648A, 0x2B4816BD87376AA3, 0x192FB0F755F9FB6B, 0x30EA8E3DAB2022B6, 0x1E236CA8E4A0E146, 0x161210380A082CA6, 0x4213AE49667A8570, 0x69E6555960AC4957, 0x005DE970A83F42BC, 0x3DD8EA530868E561, 0xACA2948D1DEE9DA6, 0x341023E50A5AF296, 0x52E28B6A39EBAF18, 0x68053536F4B78B31, 0x382AF0C23A12C318, 0x733D6B444EF44DE1, 0x76CEF1929D90BDC8, 0xBE928CE879426290, 0xA4ADA10820E40A59, 0x8A3BF58236BAB5EE, 0xF56A533A409D3015, 0xD74088F78FFBED17, 0x3F6C008F32FE3D33, 0x093C29F27ECFCF21, -0x51D36BDF7C5C3E9D, -0x6F26C2C14C981112, -0x72EAE28ED2166958, -0x7ECA4C36B688596C
+[20:40:52.008] info:    rtx.bloom.enable = False
+[20:40:52.008] info:  Attempting to parse option layer: user.conf...
+[20:40:52.008] info:  Found config file: user.conf
+[20:40:52.008] info:  Parsed config file.
+[20:40:52.008] info:  RtxOption system layer initialization complete.
+[20:40:52.009] info:  Geometry generation hash rule:
+[20:40:52.009] info:  	positions
+[20:40:52.009] info:  	indices
+[20:40:52.009] info:  	texcoords
+[20:40:52.009] info:  	geometrydescriptor
+[20:40:52.009] info:  	vertexlayout
+[20:40:52.009] info:  	vertexshader
+[20:40:52.009] info:  [Migration] Migrating from rtx.dynamicDecalTextures to rtx.decalTextures
+[20:40:52.009] info:  [Deprecated Config] rtx.dynamicDecalTextures has been deprecated, we have moved all your textures from this list to rtx.decalTextures, no further action is required from you. Please re-save your rtx config to get rid of this message.
+[20:40:52.009] info:  Geometry asset hash rule:
+[20:40:52.009] info:  	positions
+[20:40:52.009] info:  	indices
+[20:40:52.009] info:  	geometrydescriptor
+[20:40:52.009] info:  [RTX Neural Radiance Cache] Selected Ultra preset mode.
+[20:40:52.009] info:  [Migration] Migrating from rtx.nonOffsetDecalTextures to rtx.decalTextures
+[20:40:52.009] info:  [Deprecated Config] rtx.nonOffsetDecalTextures has been deprecated, we have moved all your textures from this list to rtx.decalTextures, no further action is required from you. Please re-save your rtx config to get rid of this message.
+[20:40:52.009] info:  [Migration] Migrating from rtx.singleOffsetDecalTextures to rtx.decalTextures
+[20:40:52.009] info:  [Deprecated Config] rtx.singleOffsetDecalTextures has been deprecated, we have moved all your textures from this list to rtx.decalTextures, no further action is required from you. Please re-save your rtx config to get rid of this message.
+[20:40:52.009] info:  [Migration] Migrating from rtx.particles.globalPreset.maxSpeed to rtx.particles.globalPreset.maxSpawnVelocity
+[20:40:52.009] info:  [Migration] Migrating from rtx.particles.globalPreset.maxSpeed to rtx.particles.globalPreset.maxTargetVelocity
+[20:40:52.009] info:  [Deprecated Config] rtx.particles.globalPreset.maxSpeed has been migrated to rtx.particles.globalPreset.maxSpawnVelocity and rtx.particles.globalPreset.maxTargetVelocity.Please re-save your config to get rid of this message.
+[20:40:52.009] info:  Effective RtxOption values (after all config layers and migrations):
+[20:40:52.009] info:    rtx.neuralRadianceCache.trainingMaxPathBounces = 9
+[20:40:52.009] info:    rtx.bloom.enable = False
+[20:40:52.009] info:    rtx.autoExposure.enabled = False
+[20:40:52.009] info:    rtx.graphicsPreset = 0
+[20:40:52.009] info:    rtx.postfx.enable = False
+[20:40:52.009] info:    rtx.skyAutoDetect = 2
+[20:40:52.009] info:    rtx.raytracedRenderTargetTextures = 0x1E604227861E0BCB, 0x261F0A146E18E6FA, 0x4E44041F9E27548B, 0x4E44041F9E27548E, 0x572A88A0A2E43086, 0x609466F92E702865, 0xB566CD7C690A3630, 0xD824D823D9CCF030, 0xF885C65160789A8B
+[20:40:52.009] info:    rtx.uiTextures = 0x005DE970A83F42BC, 0x093C29F27ECFCF21, 0x161210380A082CA6, 0x192FB0F755F9FB6B, 0x1D1D8E3DB8CE7310, 0x1E236CA8E4A0E146, 0x2B4816BD87376AA3, 0x30EA8E3DAB2022B6, 0x341023E50A5AF296, 0x382AF0C23A12C318, 0x3DD8EA530868E561, 0x3F6C008F32FE3D33, 0x4213AE49667A8570, 0x52E28B6A39EBAF18, 0x68053536F4B78B31, 0x69E6555960AC4957, 0x6D903948AD06648A, 0x733D6B444EF44DE1, 0x76CEF1929D90BDC8, 0x8A3BF58236BAB5EE, 0xA46C307BB6FFCB19, 0xA4ADA10820E40A59, 0xACA2948D1DEE9DA6, 0xBE928CE879426290, 0xD74088F78FFBED17, 0xD84E0241FB4E93F6, 0xDDF1BE54CD1936C8, 0xF56A533A409D3015, 0xF8A7EB3A1A6FE3FB, -0x51D36BDF7C5C3E9D, -0x6F26C2C14C981112, -0x72EAE28ED2166958, -0x7ECA4C36B688596C
+[20:40:52.009] info:  Built-in extension providers:
+[20:40:52.009] info:    Win32 WSI
+[20:40:52.009] info:    OpenVR
+[20:40:52.009] info:    OpenXR
+[20:40:52.009] info:  OpenVR: could not open registry key, status 2
+[20:40:52.009] info:  OpenVR: Failed to locate module
+[20:40:52.071] info:  Enabled instance extensions:
+[20:40:52.071] info:    VK_KHR_external_memory_capabilities
+[20:40:52.071] info:    VK_KHR_external_semaphore_capabilities
+[20:40:52.071] info:    VK_KHR_get_physical_device_properties2
+[20:40:52.071] info:    VK_KHR_get_surface_capabilities2
+[20:40:52.071] info:    VK_KHR_surface
+[20:40:52.071] info:    VK_KHR_win32_surface
+[20:40:52.077] info:  Enabled Layer Names:
+[20:40:52.128] warn:  Skipping Integrated GPU adapter: AMD Radeon(TM) Graphics
+[20:40:52.129] info:  D3D9: VK_FORMAT_D16_UNORM_S8_UINT -> VK_FORMAT_D24_UNORM_S8_UINT
+[20:40:52.129] info:  NVIDIA GeForce RTX 5070:
+[20:40:52.129] info:    Driver: 610.47.0
+[20:40:52.129] info:    Vulkan: 1.4.341
+[20:40:52.129] info:    Memory Heap[0]: 
+[20:40:52.129] info:      Size: 11943 MiB
+[20:40:52.129] info:      Flags: 0x1
+[20:40:52.129] info:      Memory Type[1]: Property Flags = 0x1
+[20:40:52.129] info:      Memory Type[4]: Property Flags = 0x7
+[20:40:52.129] info:    Memory Heap[1]: 
+[20:40:52.129] info:      Size: 15924 MiB
+[20:40:52.129] info:      Flags: 0x0
+[20:40:52.129] info:      Memory Type[0]: Property Flags = 0x0
+[20:40:52.129] info:      Memory Type[2]: Property Flags = 0x6
+[20:40:52.129] info:      Memory Type[3]: Property Flags = 0xe
+[20:40:52.129] info:  Process set as DPI aware
+[20:40:52.149] info:  Device properties:
+[20:40:52.149] info:    Device name:     : NVIDIA GeForce RTX 5070
+[20:40:52.149] info:    Vendor name:     : NVIDIA
+[20:40:52.149] info:    Device ID:       : 0x2f04
+[20:40:52.149] info:    Vendor ID:       : 0x10de
+[20:40:52.149] info:    Driver version   : 610.47.0
+[20:40:52.149] info:  Enabled device extensions:
+[20:40:52.149] info:    VK_EXT_4444_formats
+[20:40:52.149] info:    VK_EXT_calibrated_timestamps
+[20:40:52.149] info:    VK_EXT_conservative_rasterization
+[20:40:52.149] info:    VK_EXT_custom_border_color
+[20:40:52.149] info:    VK_EXT_depth_clip_enable
+[20:40:52.149] info:    VK_EXT_extended_dynamic_state
+[20:40:52.149] info:    VK_EXT_full_screen_exclusive
+[20:40:52.149] info:    VK_EXT_memory_priority
+[20:40:52.149] info:    VK_EXT_opacity_micromap
+[20:40:52.149] info:    VK_EXT_robustness2
+[20:40:52.149] info:    VK_EXT_shader_atomic_float
+[20:40:52.149] info:    VK_EXT_shader_demote_to_helper_invocation
+[20:40:52.149] info:    VK_EXT_shader_viewport_index_layer
+[20:40:52.149] info:    VK_EXT_transform_feedback
+[20:40:52.149] info:    VK_EXT_vertex_attribute_divisor
+[20:40:52.149] info:    VK_KHR_acceleration_structure
+[20:40:52.149] info:    VK_KHR_buffer_device_address
+[20:40:52.149] info:    VK_KHR_create_renderpass2
+[20:40:52.149] info:    VK_KHR_deferred_host_operations
+[20:40:52.149] info:    VK_KHR_depth_stencil_resolve
+[20:40:52.149] info:    VK_KHR_draw_indirect_count
+[20:40:52.149] info:    VK_KHR_driver_properties
+[20:40:52.149] info:    VK_KHR_external_memory
+[20:40:52.149] info:    VK_KHR_external_memory_win32
+[20:40:52.149] info:    VK_KHR_external_semaphore
+[20:40:52.149] info:    VK_KHR_external_semaphore_win32
+[20:40:52.149] info:    VK_KHR_image_format_list
+[20:40:52.149] info:    VK_KHR_maintenance4
+[20:40:52.149] info:    VK_KHR_pipeline_library
+[20:40:52.149] info:    VK_KHR_push_descriptor
+[20:40:52.149] info:    VK_KHR_ray_query
+[20:40:52.149] info:    VK_KHR_ray_tracing_pipeline
+[20:40:52.149] info:    VK_KHR_sampler_mirror_clamp_to_edge
+[20:40:52.149] info:    VK_KHR_shader_float16_int8
+[20:40:52.149] info:    VK_KHR_shader_float_controls
+[20:40:52.149] info:    VK_KHR_swapchain
+[20:40:52.149] info:    VK_KHR_synchronization2
+[20:40:52.149] info:    VK_NVX_binary_import
+[20:40:52.149] info:    VK_NVX_image_view_handle
+[20:40:52.149] info:    VK_NV_low_latency
+[20:40:52.149] info:    VK_NV_present_metering
+[20:40:52.149] info:    VK_NV_ray_tracing_invocation_reorder
+[20:40:52.149] info:  Device features:
+[20:40:52.149] info:    robustBufferAccess                     : 1
+[20:40:52.149] info:    fullDrawIndexUint32                    : 1
+[20:40:52.149] info:    imageCubeArray                         : 1
+[20:40:52.149] info:    independentBlend                       : 1
+[20:40:52.149] info:    geometryShader                         : 1
+[20:40:52.149] info:    tessellationShader                     : 0
+[20:40:52.149] info:    sampleRateShading                      : 1
+[20:40:52.149] info:    dualSrcBlend                           : 0
+[20:40:52.149] info:    logicOp                                : 0
+[20:40:52.149] info:    multiDrawIndirect                      : 0
+[20:40:52.149] info:    drawIndirectFirstInstance              : 0
+[20:40:52.149] info:    depthClamp                             : 1
+[20:40:52.149] info:    depthBiasClamp                         : 1
+[20:40:52.149] info:    fillModeNonSolid                       : 1
+[20:40:52.149] info:    depthBounds                            : 1
+[20:40:52.149] info:    multiViewport                          : 1
+[20:40:52.149] info:    samplerAnisotropy                      : 1
+[20:40:52.149] info:    textureCompressionBC                   : 1
+[20:40:52.149] info:    occlusionQueryPrecise                  : 1
+[20:40:52.149] info:    pipelineStatisticsQuery                : 1
+[20:40:52.149] info:    vertexPipelineStoresAndAtomics         : 1
+[20:40:52.149] info:    fragmentStoresAndAtomics               : 0
+[20:40:52.149] info:    shaderImageGatherExtended              : 0
+[20:40:52.149] info:    shaderStorageImageExtendedFormats      : 0
+[20:40:52.149] info:    shaderStorageImageReadWithoutFormat    : 0
+[20:40:52.149] info:    shaderStorageImageWriteWithoutFormat   : 1
+[20:40:52.149] info:    shaderClipDistance                     : 1
+[20:40:52.149] info:    shaderCullDistance                     : 1
+[20:40:52.149] info:    shaderFloat64                          : 0
+[20:40:52.149] info:    shaderInt64                            : 0
+[20:40:52.149] info:    variableMultisampleRate                : 0
+[20:40:52.149] info:    hostQueryReset                         : 1
+[20:40:52.149] info:    scalarBlockLayout                      : 1
+[20:40:52.149] info:    uniformBufferStandardLayout            : 1
+[20:40:52.149] info:  VK_EXT_4444_formats
+[20:40:52.149] info:    formatA4R4G4B4                         : 1
+[20:40:52.149] info:    formatA4B4G4R4                         : 1
+[20:40:52.149] info:  VK_EXT_custom_border_color
+[20:40:52.149] info:    customBorderColors                     : 1
+[20:40:52.149] info:    customBorderColorWithoutFormat         : 1
+[20:40:52.149] info:  VK_EXT_depth_clip_enable
+[20:40:52.149] info:    depthClipEnable                        : 1
+[20:40:52.149] info:  VK_EXT_extended_dynamic_state
+[20:40:52.149] info:    extendedDynamicState                   : 1
+[20:40:52.149] info:  VK_EXT_memory_priority
+[20:40:52.149] info:    memoryPriority                         : 1
+[20:40:52.149] info:  VK_EXT_robustness2
+[20:40:52.149] info:    robustBufferAccess2                    : 1
+[20:40:52.149] info:    robustImageAccess2                     : 0
+[20:40:52.149] info:    nullDescriptor                         : 1
+[20:40:52.149] info:  VK_EXT_shader_demote_to_helper_invocation
+[20:40:52.149] info:    shaderDemoteToHelperInvocation         : 1
+[20:40:52.149] info:  VK_EXT_transform_feedback
+[20:40:52.149] info:    transformFeedback                      : 1
+[20:40:52.149] info:    geometryStreams                        : 0
+[20:40:52.149] info:  VK_EXT_vertex_attribute_divisor
+[20:40:52.149] info:    vertexAttributeInstanceRateDivisor     : 1
+[20:40:52.149] info:    vertexAttributeInstanceRateZeroDivisor : 1
+[20:40:52.149] info:  VK_KHR_buffer_device_address
+[20:40:52.149] info:    bufferDeviceAddress                    : 1
+[20:40:52.149] info:  Queue families:
+[20:40:52.149] info:    Graphics : 0
+[20:40:52.149] info:    Transfer : 1
+[20:40:52.149] info:    Async Compute : 2
+[20:40:52.149] info:    Present : 2
+[20:40:52.328] info:  DXVK: Read 781 valid state cache entries
+[20:40:52.328] info:  DXVK: Using 7 compiler threads
+[20:40:52.329] info:  [RTX info] Neural Radiance Cache: supported
+[20:40:53.796] info:  Reflex initialized successfully.
+[20:40:53.806] info:  Automatic Raytrace Mode Preset in use (Set rtx.raytraceModePreset to something other than Auto use a non-automatic preset)
+[20:40:53.806] info:  NVIDIA architecture detected, setting default raytrace modes to Trace Ray (Indirect Integrate) and Ray Query (GBuffer, Direct Integrate)
+[20:40:53.826] info:  [RTX info] Opacity Micromap: supported
+[20:40:53.827] info:  [RTX info] Shader Execution Reordering: supported
+[20:40:53.827] info:  [RTX info] Shader Execution Reordering: enabled
+[20:40:53.827] info:  CPU supports SIMD: AVX2
+[20:40:53.830] info:  D3D9DeviceEx::ResetSwapChain:
+[20:40:53.830] info:    Requested Presentation Parameters
+[20:40:53.830] info:      - Width:              2560
+[20:40:53.830] info:      - Height:             1440
+[20:40:53.830] info:      - Format:             D3D9Format::X8R8G8B8
+[20:40:53.830] info:      - Auto Depth Stencil: false
+[20:40:53.830] info:                  ^ Format: D3D9Format::Unknown
+[20:40:53.830] info:      - Windowed:           false
+[20:40:53.841] info:  Presenter: Actual swap chain properties:
+[20:40:53.841] info:    Format:       VK_FORMAT_R8G8B8A8_UNORM
+[20:40:53.841] info:    Present mode: VK_PRESENT_MODE_IMMEDIATE_KHR
+[20:40:53.841] info:    Buffer size:  2544x1401
+[20:40:53.841] info:    Image count:  3
+[20:40:53.841] info:    Exclusive FS: 2
+[20:40:54.053] info:  Presenter: Actual swap chain properties:
+[20:40:54.053] info:    Format:       VK_FORMAT_R8G8B8A8_UNORM
+[20:40:54.053] info:    Present mode: VK_PRESENT_MODE_FIFO_KHR
+[20:40:54.053] info:    Buffer size:  2544x1401
+[20:40:54.053] info:    Image count:  4
+[20:40:54.053] info:    Exclusive FS: 2
+[20:40:54.104] info:  No winproc detected, initiating bridge message channel for: 0000000000130B18
+[20:40:54.587] warn:  D3D9DeviceEx::SetRenderState: Unhandled render state D3DRS_DITHERENABLE
+[20:40:54.587] warn:  D3D9DeviceEx::SetRenderState: Unhandled render state D3DRS_LASTPIXEL
+[20:40:54.683] info:  Message channel UWM_REMIX_BRIDGE_REGISTER_THREADPROC_MSG established.
+[20:40:54.703] info:  [RTX-Compatibility-Info] Trying to raytrace but not detecting a valid camera.
+[20:40:54.725] info:  Presenter: Actual swap chain properties:
+[20:40:54.725] info:    Format:       VK_FORMAT_R8G8B8A8_UNORM
+[20:40:54.725] info:    Present mode: VK_PRESENT_MODE_FIFO_KHR
+[20:40:54.725] info:    Buffer size:  2560x1440
+[20:40:54.725] info:    Image count:  4
+[20:40:54.725] info:    Exclusive FS: 2
+[20:40:54.833] info:  [RTX-Compatibility-Info] Skipped drawcall, using pre-transformed vertices which isn't currently supported.
+[20:41:05.858] info:  [RTX-Compatibility-Info] Texture 0 without valid hash detected, skipping drawcall.
+[20:41:05.859] info:  [RTX] Opacity Micromap: enabled
+[20:41:05.860] info:  RenderPass GBuffer Raytrace Mode: Ray Query (CS)
+[20:41:05.860] info:  RenderPass Integrate Direct Raytrace Mode: Ray Query (CS)
+[20:41:05.860] info:  RenderPass Integrate Indirect Raytrace Mode: Trace Ray (RGS)
+[20:41:05.877] info:  [RTX Neural Radiance Cache] NRC SDK: Loading the default network config data.
+[20:41:05.885] info:  [RTX Neural Radiance Cache] NRC v0.13 (22 January 2025) Context successfully initialized. 
+[20:41:05.885] info:  [RTX-Compatibility-Info] Volume Froxel Max Distance set to 2000 but current camera frustum allows only a maximum of 999.596
+[20:41:05.890] info:  [RTX] Integrate Indirect Mode: Neural Radiance Cache - activated
+[20:41:06.086] info:  Presenter: Actual swap chain properties:
+[20:41:06.086] info:    Format:       VK_FORMAT_R8G8B8A8_UNORM
+[20:41:06.086] info:    Present mode: VK_PRESENT_MODE_IMMEDIATE_KHR
+[20:41:06.086] info:    Buffer size:  2560x1440
+[20:41:06.086] info:    Image count:  4
+[20:41:06.086] info:    Exclusive FS: 2
+[20:41:06.359] info:  [RTX Opacity Micromap] Instance has non triangle list topology. This is only partially supported. Falling back to a conservative max value for estimated numTexelsPerMicroTriangle instead.
+[20:41:07.639] info:  Camera cut detected on frame 637
+[20:41:07.639] info:  [RTX] Opacity Micromap: enabled
+[20:41:07.642] info:  [RTX Neural Radiance Cache] NRC SDK: Loading the default network config data.
+[20:41:07.644] info:  [RTX Neural Radiance Cache] NRC v0.13 (22 January 2025) Context successfully initialized. 
+[20:41:08.525] info:  Camera cut detected on frame 689
+[20:41:08.525] info:  [RTX] Opacity Micromap: enabled
+[20:41:08.528] info:  [RTX Neural Radiance Cache] NRC SDK: Loading the default network config data.
+[20:41:08.530] info:  [RTX Neural Radiance Cache] NRC v0.13 (22 January 2025) Context successfully initialized. 
+[20:41:08.576] info:  Camera cut detected on frame 691
+[20:41:08.576] info:  [RTX] Opacity Micromap: enabled
+[20:41:08.577] info:  [RTX Neural Radiance Cache] NRC SDK: Loading the default network config data.
+[20:41:08.580] info:  [RTX Neural Radiance Cache] NRC v0.13 (22 January 2025) Context successfully initialized. 
+[20:41:09.938] err:   Attempted invert a non-invertible matrix.
+[20:46:10.581] info:  [RTX Opacity Micromap] Out of memory budget. Requested: 51953168 bytes. Free: 26479366 bytes, Budget: 1610612736 bytes
+[20:47:12.933] err:   [41] common device objects were not disposed of.

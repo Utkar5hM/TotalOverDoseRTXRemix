@@ -1,0 +1,4089 @@
+// TODCameraResend.asi - Total Overdose <-> RTX Remix compatibility shim.
+//
+// This is a D3D9 vtable-hook layer loaded as an ASI plugin. It does not modify
+// TOD.exe; it intercepts the device the game creates and reshapes a few things
+// RTX Remix needs in order to raytrace the game. There are four cooperating
+// subsystems:
+//
+//   1. Camera resend (ResendCameraForDraw): TOD only resubmits D3DTS_VIEW when
+//      the camera changes. Remix needs valid view/projection state at the draws
+//      it raytraces, so cached non-identity view/projection are resent before
+//      fixed-function indexed world draws. Identity-view and pre-transformed
+//      (RHW) draws are skipped so 2D/overlay passes are left alone.
+//
+//   2. Render-target redirect (Hook_SetRenderTarget / RT-composite skips): TOD
+//      renders the 3D scene into offscreen color render-target textures and then
+//      composites them to the backbuffer with pre-transformed fullscreen quads.
+//      Remix cannot raytrace that, so full-screen scene RTs are redirected to the
+//      primary backbuffer and the RT-texture composites are dropped.
+//
+//   3. Managed texture shadowing (GetOrCreateDefaultTextureCopy): Remix does not
+//      compute an image hash for D3DPOOL_MANAGED textures bound directly, so it
+//      skips those drawcalls ("Texture 0 without valid hash"). Each supported
+//      managed texture gets a SYSTEMMEM->DEFAULT shadow uploaded via
+//      UpdateTexture and the DEFAULT copy is bound at draw time. A conservative
+//      draw-time policy (ShouldShadowTextureForDraw) decides when to substitute,
+//      to avoid corrupting masks/lightmaps/video.
+//
+//   4. Candidate discovery (LogTextureCandidateForDraw): optional diagnostic
+//      scaffolding, gated by kEnableCandidateDiscovery. Classifies textures by
+//      observed draw behavior (ui / hud / video / world / effect), logs a TSV
+//      and DDS dumps so real atlas hashes can be identified offline and placed
+//      in the Remix config (rtx.uiTextures for UI/HUD, rtx.hideInstanceTextures
+//      for broken world LOD). No game content is hardcoded here, and the whole
+//      subsystem compiles out when the toggle is false.
+//
+// All shared counters use Interlocked* so the worker-thread setup and the render
+// thread do not race. Diagnostic logging is rate-limited (first N + every Nth).
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <d3d9.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define XXH_INLINE_ALL
+#include "../../third_party/dxvk-remix/src/util/xxHash/xxhash.h"
+
+namespace {
+
+constexpr DWORD kD3D9CreateDeviceIndex = 16;
+constexpr DWORD kDevicePresentIndex = 17;
+constexpr DWORD kDeviceCreateTextureIndex = 23;
+constexpr DWORD kDeviceCreateRenderTargetIndex = 28;
+constexpr DWORD kDeviceStretchRectIndex = 34;
+constexpr DWORD kDeviceSetRenderTargetIndex = 37;
+constexpr DWORD kDeviceSetDepthStencilSurfaceIndex = 39;
+constexpr DWORD kDeviceSetTransformIndex = 44;
+constexpr DWORD kDeviceSetRenderStateIndex = 57;
+constexpr DWORD kDeviceSetTextureIndex = 65;
+constexpr DWORD kDeviceDrawPrimitiveIndex = 81;
+constexpr DWORD kDeviceDrawIndexedPrimitiveIndex = 82;
+constexpr DWORD kDeviceDrawPrimitiveUPIndex = 83;
+constexpr DWORD kDeviceDrawIndexedPrimitiveUPIndex = 84;
+constexpr DWORD kDeviceCreateVertexDeclarationIndex = 86;
+constexpr DWORD kDeviceSetVertexDeclarationIndex = 87;
+constexpr DWORD kDeviceSetFVFIndex = 89;
+constexpr DWORD kDeviceSetVertexShaderIndex = 92;
+
+// Feature toggles. These encode settled decisions from the debug log; they are
+// kept as named constants so each behavior is greppable and individually
+// reversible during regression testing rather than buried in conditions.
+
+// Render-target handling (subsystem 2). The "all color RT" + "skip all RT
+// composites" pair is what removed the "non-primary render target" warning.
+constexpr bool kRedirectFullSizeSceneRtToPrimary = true;
+constexpr bool kSkipRtTextureCompositesToPrimary = true;
+constexpr bool kRedirectAllColorRtTexturesToPrimary = true;
+constexpr bool kSkipAllRtTextureComposites = true;
+// Behavior-marked UI render targets: allow a small offscreen RT to be treated as
+// a UI layer once the game draws screen-space UI into it. Full-size scene RTs are
+// never promoted this way (that would reopen the original black-screen path).
+constexpr bool kAllowBehaviorMarkedUiRenderTargets = true;
+constexpr bool kPromoteFullSizeBehaviorMarkedUiRenderTargets = false;
+// Managed texture handling (subsystem 3). PreLoad was proven insufficient and is
+// left disabled as a diagnostic switch; SYSTEMMEM->DEFAULT shadowing is the path
+// that actually gives Remix valid hashes.
+constexpr bool kPreloadManagedTexturesBeforeBind = false;
+constexpr bool kBindDefaultCopiesForManagedTextures = true;
+constexpr bool kShadowAllSupportedManagedTextures = true;
+// Candidate discovery (subsystem 4) is diagnostic scaffolding, not part of the
+// shim's runtime job: it classifies textures by draw behavior and emits a TSV +
+// DDS dumps so real atlas hashes can be identified offline and placed in the
+// Remix config (rtx.uiTextures / rtx.hideInstanceTextures). No hash ever lives
+// in this binary. Flip this to false for a shipping build and the whole harness
+// compiles out, leaving only the three runtime subsystems above.
+constexpr bool kEnableCandidateDiscovery = true;
+
+constexpr DWORD kTextureReleaseIndex = 2;
+constexpr DWORD kTextureLockRectIndex = 19;
+constexpr DWORD kTextureUnlockRectIndex = 20;
+constexpr DWORD kTextureAddDirtyRectIndex = 21;
+constexpr DWORD kTrackedTextureStages = 8;
+constexpr DWORD kMaxConfiguredUiTextureHashes = 512;
+// Safety cap on the diagnostic log. Long sessions with millions of draws can
+// otherwise grow it to hundreds of MB. Once reached, one final notice is written
+// and further lines are dropped.
+constexpr LONG kMaxLogBytes = 128 * 1024 * 1024;
+
+using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
+using CreateDeviceFn = HRESULT(APIENTRY*)(
+    IDirect3D9* self,
+    UINT adapter,
+    D3DDEVTYPE deviceType,
+    HWND focusWindow,
+    DWORD behaviorFlags,
+    D3DPRESENT_PARAMETERS* presentationParameters,
+    IDirect3DDevice9** returnedDevice);
+using PresentFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    const RECT* sourceRect,
+    const RECT* destRect,
+    HWND destWindowOverride,
+    const RGNDATA* dirtyRegion);
+using SetTransformFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    D3DTRANSFORMSTATETYPE state,
+    const D3DMATRIX* matrix);
+using CreateTextureFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    UINT levels,
+    DWORD usage,
+    D3DFORMAT format,
+    D3DPOOL pool,
+    IDirect3DTexture9** texture,
+    HANDLE* sharedHandle);
+using CreateRenderTargetFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    D3DFORMAT format,
+    D3DMULTISAMPLE_TYPE multiSample,
+    DWORD multisampleQuality,
+    BOOL lockable,
+    IDirect3DSurface9** surface,
+    HANDLE* sharedHandle);
+using StretchRectFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    IDirect3DSurface9* sourceSurface,
+    const RECT* sourceRect,
+    IDirect3DSurface9* destSurface,
+    const RECT* destRect,
+    D3DTEXTUREFILTERTYPE filter);
+using SetRenderTargetFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    DWORD renderTargetIndex,
+    IDirect3DSurface9* surface);
+using SetDepthStencilSurfaceFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    IDirect3DSurface9* surface);
+using SetTextureFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    DWORD stage,
+    IDirect3DBaseTexture9* texture);
+using SetRenderStateFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    D3DRENDERSTATETYPE state,
+    DWORD value);
+using DrawPrimitiveFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT startVertex,
+    UINT primitiveCount);
+using DrawIndexedPrimitiveFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    INT baseVertexIndex,
+    UINT minVertexIndex,
+    UINT numVertices,
+    UINT startIndex,
+    UINT primitiveCount);
+using DrawPrimitiveUPFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount,
+    const void* vertexStreamZeroData,
+    UINT vertexStreamZeroStride);
+using DrawIndexedPrimitiveUPFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT minVertexIndex,
+    UINT numVertices,
+    UINT primitiveCount,
+    const void* indexData,
+    D3DFORMAT indexDataFormat,
+    const void* vertexStreamZeroData,
+    UINT vertexStreamZeroStride);
+using CreateVertexDeclarationFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    const D3DVERTEXELEMENT9* vertexElements,
+    IDirect3DVertexDeclaration9** declaration);
+using SetVertexDeclarationFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    IDirect3DVertexDeclaration9* declaration);
+using SetFVFFn = HRESULT(APIENTRY*)(IDirect3DDevice9* self, DWORD fvf);
+using SetVertexShaderFn = HRESULT(APIENTRY*)(
+    IDirect3DDevice9* self,
+    IDirect3DVertexShader9* shader);
+using TextureReleaseFn = ULONG(APIENTRY*)(IDirect3DTexture9* self);
+using TextureLockRectFn = HRESULT(APIENTRY*)(
+    IDirect3DTexture9* self,
+    UINT level,
+    D3DLOCKED_RECT* lockedRect,
+    const RECT* rect,
+    DWORD flags);
+using TextureUnlockRectFn = HRESULT(APIENTRY*)(IDirect3DTexture9* self, UINT level);
+using TextureAddDirtyRectFn = HRESULT(APIENTRY*)(IDirect3DTexture9* self, const RECT* dirtyRect);
+
+struct DeclInfo {
+  IDirect3DVertexDeclaration9* declaration;
+  bool hasPosition;
+  bool hasPositionT;
+};
+
+struct LayoutState {
+  DWORD fvf;
+  IDirect3DVertexDeclaration9* declaration;
+  IDirect3DVertexShader9* vertexShader;
+  bool fvfRhw;
+  bool declarationPositionT;
+  bool shaderActive;
+  bool unknown;
+};
+
+struct SurfaceInfo {
+  IDirect3DSurface9* surface;
+  IDirect3DBaseTexture9* ownerTexture;
+  UINT width;
+  UINT height;
+  D3DFORMAT format;
+  DWORD usage;
+  D3DPOOL pool;
+  bool fromTexture;
+};
+
+struct TextureInfo {
+  IDirect3DBaseTexture9* texture;
+  IDirect3DSurface9* level0Surface;
+  UINT width;
+  UINT height;
+  UINT levels;
+  D3DFORMAT format;
+  DWORD usage;
+  D3DPOOL pool;
+  bool rtxHashAttempted;
+  bool rtxHashValid;
+  bool configuredUiTexture;
+  unsigned long long rtxHash;
+};
+
+struct TextureCopyInfo {
+  IDirect3DBaseTexture9* source;
+  IDirect3DTexture9* staging;
+  IDirect3DBaseTexture9* replacement;
+  UINT width;
+  UINT height;
+  UINT levels;
+  D3DFORMAT format;
+  DWORD dirtyLevels;
+  DWORD writeLockedLevels;
+  bool attempted;
+  bool dirty;
+  bool uploaded;
+};
+
+struct TextureCandidateInfo {
+  IDirect3DBaseTexture9* texture;
+  UINT width;
+  UINT height;
+  UINT levels;
+  D3DFORMAT format;
+  DWORD usage;
+  D3DPOOL pool;
+  DWORD roleBits;
+  unsigned long long rtxHash;
+};
+
+struct RtTextureUsageInfo {
+  IDirect3DBaseTexture9* texture;
+  bool containsScreenSpaceUi;
+  LONG uiDraws;
+  LONG nativeTargetSets;
+  LONG allowedComposites;
+};
+
+// Candidate roles, keyed purely on observed draw behavior (no game content is
+// hardcoded). The discriminator that separates the menu from the in-game HUD is
+// frame ordering: menu/fullscreen UI is drawn before any 3D world geometry in the
+// frame, whereas the in-game HUD is the screen-space layer drawn after the world.
+constexpr DWORD kCandidateRoleUi = 1u << 0;        // RHW screen-space, before world
+constexpr DWORD kCandidateRoleVideo = 1u << 1;     // large one-mip A8 screen-space
+constexpr DWORD kCandidateRoleWorldUnshadowed = 1u << 2;
+constexpr DWORD kCandidateRoleHud = 1u << 3;       // RHW screen-space, after world
+constexpr DWORD kCandidateRoleEffect = 1u << 4;    // fixed-function overlay sprites
+constexpr DWORD kCandidateRoleWorld = 1u << 5;     // 3D fixed-function world geometry
+constexpr LONG kMaxTextureCandidateDumps = 2048;
+
+constexpr DWORD kDdsdCaps = 0x00000001u;
+constexpr DWORD kDdsdHeight = 0x00000002u;
+constexpr DWORD kDdsdWidth = 0x00000004u;
+constexpr DWORD kDdsdPitch = 0x00000008u;
+constexpr DWORD kDdsdPixelFormat = 0x00001000u;
+constexpr DWORD kDdsdLinearSize = 0x00080000u;
+constexpr DWORD kDdpfAlphaPixels = 0x00000001u;
+constexpr DWORD kDdpfAlpha = 0x00000002u;
+constexpr DWORD kDdpfFourCc = 0x00000004u;
+constexpr DWORD kDdpfRgb = 0x00000040u;
+constexpr DWORD kDdpfLuminance = 0x00020000u;
+constexpr DWORD kDdsCapsTexture = 0x00001000u;
+
+struct DdsPixelFormat {
+  DWORD size;
+  DWORD flags;
+  DWORD fourCc;
+  DWORD rgbBitCount;
+  DWORD rBitMask;
+  DWORD gBitMask;
+  DWORD bBitMask;
+  DWORD aBitMask;
+};
+
+struct DdsHeader {
+  DWORD size;
+  DWORD flags;
+  DWORD height;
+  DWORD width;
+  DWORD pitchOrLinearSize;
+  DWORD depth;
+  DWORD mipMapCount;
+  DWORD reserved1[11];
+  DdsPixelFormat pixelFormat;
+  DWORD caps;
+  DWORD caps2;
+  DWORD caps3;
+  DWORD caps4;
+  DWORD reserved2;
+};
+
+char g_gameRoot[MAX_PATH * 2] = {};
+char g_logPath[MAX_PATH * 2] = {};
+char g_candidatePath[MAX_PATH * 2] = {};
+char g_candidateTextureDumpDir[MAX_PATH * 2] = {};
+char g_hudCandidateTextureDumpDir[MAX_PATH * 2] = {};
+char g_worldCandidateTextureDumpDir[MAX_PATH * 2] = {};
+
+CreateDeviceFn g_origCreateDevice = nullptr;
+PresentFn g_origPresent = nullptr;
+CreateTextureFn g_origCreateTexture = nullptr;
+CreateRenderTargetFn g_origCreateRenderTarget = nullptr;
+StretchRectFn g_origStretchRect = nullptr;
+SetRenderTargetFn g_origSetRenderTarget = nullptr;
+SetDepthStencilSurfaceFn g_origSetDepthStencilSurface = nullptr;
+SetTransformFn g_origSetTransform = nullptr;
+SetRenderStateFn g_origSetRenderState = nullptr;
+SetTextureFn g_origSetTexture = nullptr;
+DrawPrimitiveFn g_origDrawPrimitive = nullptr;
+DrawIndexedPrimitiveFn g_origDrawIndexedPrimitive = nullptr;
+DrawPrimitiveUPFn g_origDrawPrimitiveUP = nullptr;
+DrawIndexedPrimitiveUPFn g_origDrawIndexedPrimitiveUP = nullptr;
+CreateVertexDeclarationFn g_origCreateVertexDeclaration = nullptr;
+SetVertexDeclarationFn g_origSetVertexDeclaration = nullptr;
+SetFVFFn g_origSetFVF = nullptr;
+SetVertexShaderFn g_origSetVertexShader = nullptr;
+TextureReleaseFn g_origTextureRelease = nullptr;
+TextureLockRectFn g_origTextureLockRect = nullptr;
+TextureUnlockRectFn g_origTextureUnlockRect = nullptr;
+TextureAddDirtyRectFn g_origTextureAddDirtyRect = nullptr;
+
+D3DMATRIX g_lastView = {};
+D3DMATRIX g_lastProjection = {};
+DWORD g_currentFvf = 0;
+IDirect3DVertexDeclaration9* g_currentDeclaration = nullptr;
+IDirect3DVertexShader9* g_currentVertexShader = nullptr;
+IDirect3DSurface9* g_currentRenderTarget0 = nullptr;
+IDirect3DSurface9* g_requestedRenderTarget0 = nullptr;
+IDirect3DSurface9* g_currentDepthStencil = nullptr;
+IDirect3DBaseTexture9* g_currentTexture0 = nullptr;
+IDirect3DBaseTexture9* g_sourceTextureStages[kTrackedTextureStages] = {};
+IDirect3DBaseTexture9* g_boundTextureStages[kTrackedTextureStages] = {};
+IDirect3DSurface9* g_primaryRenderTarget = nullptr;
+bool g_currentRenderTarget0Redirected = false;
+volatile LONG g_currentViewIsIdentity = 0;
+DWORD g_rsZEnable = D3DZB_TRUE;
+DWORD g_rsZWriteEnable = TRUE;
+DWORD g_rsAlphaBlendEnable = FALSE;
+DWORD g_rsAlphaTestEnable = FALSE;
+DWORD g_rsLighting = TRUE;
+DWORD g_rsFogEnable = FALSE;
+DeclInfo g_declInfo[512] = {};
+SurfaceInfo g_surfaceInfo[2048] = {};
+TextureInfo g_textureInfo[16384] = {};
+TextureCopyInfo g_textureCopyInfo[8192] = {};
+TextureCandidateInfo g_textureCandidateInfo[4096] = {};
+RtTextureUsageInfo g_rtTextureUsageInfo[512] = {};
+unsigned long long g_configuredUiTextureHashes[kMaxConfiguredUiTextureHashes] = {};
+
+volatile LONG g_declInfoCount = 0;
+volatile LONG g_surfaceInfoCount = 0;
+volatile LONG g_textureInfoCount = 0;
+volatile LONG g_textureCopyInfoCount = 0;
+volatile LONG g_textureCandidateInfoCount = 0;
+volatile LONG g_rtTextureUsageInfoCount = 0;
+volatile LONG g_configuredUiTextureHashCount = 0;
+volatile LONG g_textureCandidateRows = 0;
+volatile LONG g_textureCandidateHeaderWritten = 0;
+volatile LONG g_textureCandidateDumps = 0;
+volatile LONG g_haveView = 0;
+volatile LONG g_haveProjection = 0;
+volatile LONG g_ignoredIdentityViews = 0;
+volatile LONG g_resendDepth = 0;
+volatile LONG g_logLock = 0;
+volatile LONG g_logBytesWritten = 0;
+volatile LONG g_logCapNotified = 0;
+volatile LONG g_logTruncated = 0;
+volatile LONG g_deviceHooked = 0;
+volatile LONG g_createDeviceCalls = 0;
+volatile LONG g_setViewCalls = 0;
+volatile LONG g_setProjectionCalls = 0;
+volatile LONG g_setFvfCalls = 0;
+volatile LONG g_createTextureCalls = 0;
+volatile LONG g_createRenderTargetCalls = 0;
+volatile LONG g_setRenderTargetCalls = 0;
+volatile LONG g_setDepthStencilCalls = 0;
+volatile LONG g_setRenderStateCalls = 0;
+volatile LONG g_setTextureCalls = 0;
+volatile LONG g_preloadTextureCalls = 0;
+volatile LONG g_textureCopyAttempts = 0;
+volatile LONG g_textureCopySuccesses = 0;
+volatile LONG g_textureCopyFailures = 0;
+volatile LONG g_textureCopyBinds = 0;
+volatile LONG g_drawTimeTextureBinds = 0;
+volatile LONG g_overlayStateTextureBinds = 0;
+volatile LONG g_configuredUiTextureBinds = 0;
+volatile LONG g_configuredUiTextureHashHits = 0;
+volatile LONG g_textureDirtyMarks = 0;
+volatile LONG g_textureShadowUploads = 0;
+volatile LONG g_textureShadowUploadFailures = 0;
+volatile LONG g_textureStaleShadows = 0;
+volatile LONG g_textureReleaseCalls = 0;
+volatile LONG g_textureLockCalls = 0;
+volatile LONG g_textureUnlockCalls = 0;
+volatile LONG g_textureAddDirtyCalls = 0;
+volatile LONG g_stretchRectCalls = 0;
+volatile LONG g_redirectedRenderTargetCalls = 0;
+volatile LONG g_skippedRtCompositeDraws = 0;
+volatile LONG g_markedUiRtDraws = 0;
+volatile LONG g_nativeUiRenderTargetSets = 0;
+volatile LONG g_allowedUiRtCompositeDraws = 0;
+volatile LONG g_setDeclarationCalls = 0;
+volatile LONG g_createDeclarationCalls = 0;
+volatile LONG g_setVertexShaderCalls = 0;
+volatile LONG g_presentCalls = 0;
+volatile LONG g_frameDrawIndex = 0;
+volatile LONG g_worldDrawnThisFrame = 0;
+volatile LONG g_hudCandidateRows = 0;
+volatile LONG g_indexedDrawCalls = 0;
+volatile LONG g_primitiveDrawCalls = 0;
+volatile LONG g_indexedUpDrawCalls = 0;
+volatile LONG g_primitiveUpDrawCalls = 0;
+volatile LONG g_resendCalls = 0;
+volatile LONG g_skippedCameraResendsIdentityView = 0;
+volatile LONG g_fixedFunctionIndexedDraws = 0;
+volatile LONG g_preTransformedIndexedDraws = 0;
+volatile LONG g_shaderIndexedDraws = 0;
+volatile LONG g_unknownIndexedDraws = 0;
+volatile LONG g_preTransformedPrimitiveDraws = 0;
+volatile LONG g_preTransformedUpDraws = 0;
+
+LONG ClampedCount(volatile LONG* value, LONG maxCount);
+bool TryGetCachedRtxTextureHash(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long* outHash,
+    bool* outConfiguredUi);
+
+void StripFileName(char* path) {
+  char* slash = strrchr(path, '\\');
+  if (slash != nullptr) {
+    *slash = '\0';
+  }
+}
+
+void InitializePaths(HMODULE module) {
+  char modulePath[MAX_PATH * 2] = {};
+  if (GetModuleFileNameA(module, modulePath, static_cast<DWORD>(sizeof(modulePath))) == 0) {
+    GetCurrentDirectoryA(static_cast<DWORD>(sizeof(g_gameRoot)), g_gameRoot);
+  } else {
+    StripFileName(modulePath);
+    strcpy_s(g_gameRoot, modulePath);
+
+    char* lastSlash = strrchr(g_gameRoot, '\\');
+    if (lastSlash != nullptr && _stricmp(lastSlash + 1, "scripts") == 0) {
+      *lastSlash = '\0';
+    }
+  }
+
+  snprintf(
+      g_logPath,
+      sizeof(g_logPath),
+      "%s\\rtx-remix\\logs\\tod-camera-resend.log",
+      g_gameRoot);
+  snprintf(
+      g_candidatePath,
+      sizeof(g_candidatePath),
+      "%s\\rtx-remix\\logs\\tod-remix-candidates.tsv",
+      g_gameRoot);
+  snprintf(
+      g_candidateTextureDumpDir,
+      sizeof(g_candidateTextureDumpDir),
+      "%s\\rtx-remix\\logs\\tod-candidate-textures",
+      g_gameRoot);
+  snprintf(
+      g_hudCandidateTextureDumpDir,
+      sizeof(g_hudCandidateTextureDumpDir),
+      "%s\\rtx-remix\\logs\\tod-candidate-hud",
+      g_gameRoot);
+  snprintf(
+      g_worldCandidateTextureDumpDir,
+      sizeof(g_worldCandidateTextureDumpDir),
+      "%s\\rtx-remix\\logs\\tod-candidate-world",
+      g_gameRoot);
+}
+
+void LockLog() {
+  while (InterlockedCompareExchange(const_cast<LONG*>(&g_logLock), 1, 0) != 0) {
+    Sleep(0);
+  }
+}
+
+void UnlockLog() {
+  InterlockedExchange(const_cast<LONG*>(&g_logLock), 0);
+}
+
+void EnsureLogDirectory() {
+  char remixDir[MAX_PATH * 2] = {};
+  char logsDir[MAX_PATH * 2] = {};
+  snprintf(remixDir, sizeof(remixDir), "%s\\rtx-remix", g_gameRoot);
+  snprintf(logsDir, sizeof(logsDir), "%s\\rtx-remix\\logs", g_gameRoot);
+  CreateDirectoryA(remixDir, nullptr);
+  CreateDirectoryA(logsDir, nullptr);
+  if (g_candidateTextureDumpDir[0] != '\0') {
+    CreateDirectoryA(g_candidateTextureDumpDir, nullptr);
+  }
+  if (g_hudCandidateTextureDumpDir[0] != '\0') {
+    CreateDirectoryA(g_hudCandidateTextureDumpDir, nullptr);
+  }
+  if (g_worldCandidateTextureDumpDir[0] != '\0') {
+    CreateDirectoryA(g_worldCandidateTextureDumpDir, nullptr);
+  }
+}
+
+void Log(const char* fmt, ...) {
+  char msg[1024] = {};
+
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf_s(msg, sizeof(msg), _TRUNCATE, fmt, args);
+  va_end(args);
+
+  SYSTEMTIME st = {};
+  GetLocalTime(&st);
+
+  char line[1280] = {};
+  const int count = snprintf(
+      line,
+      sizeof(line),
+      "%04u-%02u-%02u %02u:%02u:%02u.%03u %s\r\n",
+      st.wYear,
+      st.wMonth,
+      st.wDay,
+      st.wHour,
+      st.wMinute,
+      st.wSecond,
+      st.wMilliseconds,
+      msg);
+
+  if (count <= 0) {
+    return;
+  }
+
+  // Enforce the log size cap. Drop lines once over the limit, but write one final
+  // notice so the truncation is visible rather than silent.
+  const LONG priorBytes = InterlockedExchangeAdd(const_cast<LONG*>(&g_logBytesWritten), count);
+  if (priorBytes >= kMaxLogBytes) {
+    if (InterlockedCompareExchange(const_cast<LONG*>(&g_logCapNotified), 1, 0) != 0) {
+      return;
+    }
+    snprintf(
+        line,
+        sizeof(line),
+        "log size cap of %ld MB reached; further log lines are suppressed\r\n",
+        kMaxLogBytes / (1024 * 1024));
+  }
+
+  LockLog();
+  EnsureLogDirectory();
+
+  // The first line of each process truncates the log so it never inherits a prior
+  // run's contents (the log would otherwise grow without bound across runs).
+  const bool truncate =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_logTruncated), 1, 0) == 0;
+  HANDLE file = CreateFileA(
+      g_logPath[0] != '\0' ? g_logPath : "rtx-remix\\logs\\tod-camera-resend.log",
+      truncate ? GENERIC_WRITE : FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      truncate ? CREATE_ALWAYS : OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+}
+
+char* TrimAscii(char* value) {
+  if (value == nullptr) {
+    return value;
+  }
+
+  while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+    ++value;
+  }
+
+  char* end = value + strlen(value);
+  while (end > value) {
+    const char c = *(end - 1);
+    if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+      break;
+    }
+    --end;
+  }
+  *end = '\0';
+  return value;
+}
+
+bool ParseHashToken(char* token, bool* negative, unsigned long long* value) {
+  if (token == nullptr || negative == nullptr || value == nullptr) {
+    return false;
+  }
+
+  char* trimmed = TrimAscii(token);
+  if (*trimmed == '\0') {
+    return false;
+  }
+
+  *negative = false;
+  if (*trimmed == '-') {
+    *negative = true;
+    ++trimmed;
+    trimmed = TrimAscii(trimmed);
+  }
+
+  if (trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) {
+    trimmed += 2;
+  }
+
+  if (*trimmed == '\0') {
+    return false;
+  }
+
+  char* parseEnd = nullptr;
+  const unsigned long long parsed = _strtoui64(trimmed, &parseEnd, 16);
+  if (parseEnd == trimmed) {
+    return false;
+  }
+
+  *value = parsed;
+  return true;
+}
+
+bool ConfiguredUiTextureHashContains(unsigned long long hash) {
+  const LONG count =
+      ClampedCount(&g_configuredUiTextureHashCount, kMaxConfiguredUiTextureHashes);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_configuredUiTextureHashes[i] == hash) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void AddConfiguredUiTextureHash(unsigned long long hash) {
+  if (hash == 0 || ConfiguredUiTextureHashContains(hash)) {
+    return;
+  }
+
+  const LONG count =
+      ClampedCount(&g_configuredUiTextureHashCount, kMaxConfiguredUiTextureHashes);
+  if (count >= static_cast<LONG>(kMaxConfiguredUiTextureHashes)) {
+    return;
+  }
+
+  g_configuredUiTextureHashes[count] = hash;
+  InterlockedExchange(const_cast<LONG*>(&g_configuredUiTextureHashCount), count + 1);
+}
+
+void RemoveConfiguredUiTextureHash(unsigned long long hash) {
+  const LONG count =
+      ClampedCount(&g_configuredUiTextureHashCount, kMaxConfiguredUiTextureHashes);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_configuredUiTextureHashes[i] != hash) {
+      continue;
+    }
+
+    for (LONG j = i + 1; j < count; ++j) {
+      g_configuredUiTextureHashes[j - 1] = g_configuredUiTextureHashes[j];
+    }
+    g_configuredUiTextureHashes[count - 1] = 0;
+    InterlockedExchange(const_cast<LONG*>(&g_configuredUiTextureHashCount), count - 1);
+    return;
+  }
+}
+
+void ParseConfiguredUiTextureLine(char* line) {
+  char* trimmed = TrimAscii(line);
+  if (trimmed == nullptr || *trimmed == '\0' || *trimmed == '#' || *trimmed == ';') {
+    return;
+  }
+
+  if (_strnicmp(trimmed, "rtx.uiTextures", 14) != 0) {
+    return;
+  }
+
+  char* equals = strchr(trimmed, '=');
+  if (equals == nullptr) {
+    return;
+  }
+
+  char* cursor = equals + 1;
+  while (cursor != nullptr && *cursor != '\0') {
+    char* comma = strchr(cursor, ',');
+    if (comma != nullptr) {
+      *comma = '\0';
+    }
+
+    char* comment = strchr(cursor, '#');
+    if (comment != nullptr) {
+      *comment = '\0';
+    }
+
+    bool negative = false;
+    unsigned long long hash = 0;
+    if (ParseHashToken(cursor, &negative, &hash)) {
+      if (negative) {
+        RemoveConfiguredUiTextureHash(hash);
+      } else {
+        AddConfiguredUiTextureHash(hash);
+      }
+    }
+
+    cursor = comma != nullptr ? comma + 1 : nullptr;
+  }
+}
+
+void LoadConfiguredUiTextureHashesFromFile(const char* path) {
+  FILE* file = nullptr;
+  if (path == nullptr || fopen_s(&file, path, "r") != 0 || file == nullptr) {
+    return;
+  }
+
+  char line[4096] = {};
+  while (fgets(line, sizeof(line), file) != nullptr) {
+    ParseConfiguredUiTextureLine(line);
+  }
+
+  fclose(file);
+}
+
+void LoadConfiguredUiTextureHashes() {
+  InterlockedExchange(const_cast<LONG*>(&g_configuredUiTextureHashCount), 0);
+  memset(g_configuredUiTextureHashes, 0, sizeof(g_configuredUiTextureHashes));
+
+  char rootConfig[MAX_PATH * 2] = {};
+  char scriptsConfig[MAX_PATH * 2] = {};
+  snprintf(rootConfig, sizeof(rootConfig), "%s\\rtx.conf", g_gameRoot);
+  snprintf(scriptsConfig, sizeof(scriptsConfig), "%s\\scripts\\rtx.conf", g_gameRoot);
+
+  LoadConfiguredUiTextureHashesFromFile(rootConfig);
+  LoadConfiguredUiTextureHashesFromFile(scriptsConfig);
+
+  Log(
+      "loaded configured RTX UI texture hashes: count=%ld",
+      InterlockedCompareExchange(const_cast<LONG*>(&g_configuredUiTextureHashCount), 0, 0));
+}
+
+bool NearlyEqual(float a, float b) {
+  const float delta = a - b;
+  return delta > -0.0001f && delta < 0.0001f;
+}
+
+bool IsIdentityView(const D3DMATRIX& matrix) {
+  return NearlyEqual(matrix._11, 1.0f) && NearlyEqual(matrix._12, 0.0f) &&
+      NearlyEqual(matrix._13, 0.0f) && NearlyEqual(matrix._14, 0.0f) &&
+      NearlyEqual(matrix._21, 0.0f) && NearlyEqual(matrix._22, 1.0f) &&
+      NearlyEqual(matrix._23, 0.0f) && NearlyEqual(matrix._24, 0.0f) &&
+      NearlyEqual(matrix._31, 0.0f) && NearlyEqual(matrix._32, 0.0f) &&
+      NearlyEqual(matrix._33, 1.0f) && NearlyEqual(matrix._34, 0.0f) &&
+      NearlyEqual(matrix._41, 0.0f) && NearlyEqual(matrix._42, 0.0f) &&
+      NearlyEqual(matrix._43, 0.0f) && NearlyEqual(matrix._44, 1.0f);
+}
+
+bool IsPreTransformedFvf(DWORD fvf) {
+  return (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+}
+
+// A D3D orthographic projection has w' = 1 (row 3 = 0, _44 = 1), whereas a
+// perspective projection feeds z into w (_34 = +/-1, _44 = 0). Gameplay HUD/pause
+// overlays are typically drawn under an ortho projection, so this is a clean,
+// content-agnostic signal for separating overlay draws from the 3D world.
+bool IsOrthographicProjection(const D3DMATRIX& matrix) {
+  return NearlyEqual(matrix._34, 0.0f) && NearlyEqual(matrix._44, 1.0f);
+}
+
+const char* FormatName(D3DFORMAT format) {
+  switch (format) {
+    case D3DFMT_UNKNOWN:
+      return "UNKNOWN";
+    case D3DFMT_R5G6B5:
+      return "R5G6B5";
+    case D3DFMT_X1R5G5B5:
+      return "X1R5G5B5";
+    case D3DFMT_A1R5G5B5:
+      return "A1R5G5B5";
+    case D3DFMT_X8R8G8B8:
+      return "X8R8G8B8";
+    case D3DFMT_A8R8G8B8:
+      return "A8R8G8B8";
+    case D3DFMT_A8:
+      return "A8";
+    case D3DFMT_L8:
+      return "L8";
+    case D3DFMT_A8L8:
+      return "A8L8";
+    case D3DFMT_DXT1:
+      return "DXT1";
+    case D3DFMT_DXT3:
+      return "DXT3";
+    case D3DFMT_DXT5:
+      return "DXT5";
+    case D3DFMT_D16:
+      return "D16";
+    case D3DFMT_D24S8:
+      return "D24S8";
+    case D3DFMT_D24X8:
+      return "D24X8";
+    default:
+      return "OTHER";
+  }
+}
+
+bool IsRenderTargetUsage(DWORD usage) {
+  return (usage & D3DUSAGE_RENDERTARGET) != 0;
+}
+
+bool IsManagedRegularTexture(const TextureInfo* info) {
+  return info != nullptr && info->pool == D3DPOOL_MANAGED &&
+      !IsRenderTargetUsage(info->usage);
+}
+
+bool IsSupportedShadowFormat(D3DFORMAT format) {
+  switch (format) {
+    case D3DFMT_DXT1:
+    case D3DFMT_DXT2:
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
+    case D3DFMT_DXT5:
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_A8L8:
+    case D3DFMT_A8:
+    case D3DFMT_L8:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool ShouldCreateDefaultTextureCopy(const TextureInfo* info) {
+  if (!kShadowAllSupportedManagedTextures || !IsManagedRegularTexture(info)) {
+    return false;
+  }
+
+  return IsSupportedShadowFormat(info->format);
+}
+
+bool IsCompressedTextureFormat(D3DFORMAT format) {
+  switch (format) {
+    case D3DFMT_DXT1:
+    case D3DFMT_DXT2:
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
+    case D3DFMT_DXT5:
+      return true;
+    default:
+      return false;
+  }
+}
+
+bool IsDepthDisabledForOverlay() {
+  return g_rsZEnable == D3DZB_FALSE || g_rsZWriteEnable == FALSE;
+}
+
+bool IsAlphaEnabledForOverlay() {
+  return g_rsAlphaBlendEnable != FALSE || g_rsAlphaTestEnable != FALSE;
+}
+
+bool IsOverlayRenderStateActive() {
+  return IsDepthDisabledForOverlay() && IsAlphaEnabledForOverlay();
+}
+
+// True when a draw is a fixed-function (FVF, non-RHW, non-shader) primitive that
+// runs with overlay render state on the primary target. This is the in-world HUD
+// signature: it goes through the same 3D pipeline as the world, so it never shows
+// up as RHW/screen-space, but it disables depth and enables alpha like an overlay.
+bool IsFixedFunctionOverlayDraw(const LayoutState& layout) {
+  if (layout.fvfRhw || layout.declarationPositionT || layout.shaderActive || layout.unknown) {
+    return false;
+  }
+
+  return g_currentRenderTarget0 != nullptr && g_currentRenderTarget0 == g_primaryRenderTarget &&
+      IsOverlayRenderStateActive();
+}
+
+bool IsBehaviorOverlayDraw(const LayoutState& layout) {
+  if (layout.fvfRhw || layout.declarationPositionT) {
+    return true;
+  }
+
+  return IsFixedFunctionOverlayDraw(layout);
+}
+
+bool ShouldShadowTextureForDraw(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    const LayoutState& layout) {
+  if (!ShouldCreateDefaultTextureCopy(info)) {
+    return false;
+  }
+
+  if (IsCompressedTextureFormat(info->format)) {
+    return true;
+  }
+
+  unsigned long long rtxHash = 0;
+  bool configuredUi = false;
+  if (TryGetCachedRtxTextureHash(texture, info, &rtxHash, &configuredUi) && configuredUi) {
+    return true;
+  }
+
+  // Uncompressed A8/X8 textures are often masks, lightmaps, movies, or UI. Outside
+  // configured UI hashes, only substitute them when draw behavior proves overlay use.
+  return IsBehaviorOverlayDraw(layout);
+}
+
+UINT MinUInt(UINT a, UINT b) {
+  return a < b ? a : b;
+}
+
+int MinInt(int a, int b) {
+  return a < b ? a : b;
+}
+
+bool ComputeTextureCopyLayout(D3DFORMAT format, UINT width, UINT height, UINT* rowBytes, UINT* rowCount) {
+  if (rowBytes == nullptr || rowCount == nullptr) {
+    return false;
+  }
+
+  switch (format) {
+    case D3DFMT_DXT1:
+      *rowBytes = ((width + 3) / 4) * 8;
+      *rowCount = (height + 3) / 4;
+      break;
+    case D3DFMT_DXT2:
+    case D3DFMT_DXT3:
+    case D3DFMT_DXT4:
+    case D3DFMT_DXT5:
+      *rowBytes = ((width + 3) / 4) * 16;
+      *rowCount = (height + 3) / 4;
+      break;
+    case D3DFMT_A8R8G8B8:
+    case D3DFMT_X8R8G8B8:
+      *rowBytes = width * 4;
+      *rowCount = height;
+      break;
+    case D3DFMT_R5G6B5:
+    case D3DFMT_X1R5G5B5:
+    case D3DFMT_A1R5G5B5:
+    case D3DFMT_A8L8:
+      *rowBytes = width * 2;
+      *rowCount = height;
+      break;
+    case D3DFMT_A8:
+    case D3DFMT_L8:
+      *rowBytes = width;
+      *rowCount = height;
+      break;
+    default:
+      return false;
+  }
+
+  if (*rowBytes == 0) {
+    *rowBytes = 1;
+  }
+  if (*rowCount == 0) {
+    *rowCount = 1;
+  }
+  return true;
+}
+
+bool IsPrimarySurfaceInfo(const SurfaceInfo* info) {
+  return info != nullptr && !info->fromTexture;
+}
+
+bool IsFullSizeSceneRenderTarget(const SurfaceInfo* info) {
+  return info != nullptr && info->fromTexture && info->width >= 2000 &&
+      info->height >= 1000 && info->format == D3DFMT_A8R8G8B8;
+}
+
+bool IsColorRenderTargetTextureSurface(const SurfaceInfo* info) {
+  return info != nullptr && info->fromTexture && IsRenderTargetUsage(info->usage) &&
+      info->format == D3DFMT_A8R8G8B8;
+}
+
+LONG ClampedCount(volatile LONG* value, LONG maxCount) {
+  LONG count = InterlockedCompareExchange(const_cast<LONG*>(value), 0, 0);
+  if (count > maxCount) {
+    count = maxCount;
+  }
+  return count;
+}
+
+const SurfaceInfo* FindSurfaceInfo(IDirect3DSurface9* surface) {
+  if (surface == nullptr) {
+    return nullptr;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_surfaceInfo) / sizeof(g_surfaceInfo[0]));
+  const LONG count = ClampedCount(&g_surfaceInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_surfaceInfo[i].surface == surface) {
+      return &g_surfaceInfo[i];
+    }
+  }
+
+  return nullptr;
+}
+
+SurfaceInfo* RegisterSurface(
+    IDirect3DSurface9* surface,
+    IDirect3DBaseTexture9* ownerTexture,
+    UINT width,
+    UINT height,
+    D3DFORMAT format,
+    DWORD usage,
+    D3DPOOL pool,
+    bool fromTexture) {
+  if (surface == nullptr) {
+    return nullptr;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_surfaceInfo) / sizeof(g_surfaceInfo[0]));
+  LONG count = ClampedCount(&g_surfaceInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_surfaceInfo[i].surface == surface) {
+      g_surfaceInfo[i].ownerTexture = ownerTexture;
+      g_surfaceInfo[i].width = width;
+      g_surfaceInfo[i].height = height;
+      g_surfaceInfo[i].format = format;
+      g_surfaceInfo[i].usage = usage;
+      g_surfaceInfo[i].pool = pool;
+      g_surfaceInfo[i].fromTexture = fromTexture;
+      return &g_surfaceInfo[i];
+    }
+  }
+
+  if (count >= maxCount) {
+    return nullptr;
+  }
+
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_surfaceInfoCount)) - 1;
+  if (index < 0 || index >= maxCount) {
+    return nullptr;
+  }
+
+  g_surfaceInfo[index].surface = surface;
+  g_surfaceInfo[index].ownerTexture = ownerTexture;
+  g_surfaceInfo[index].width = width;
+  g_surfaceInfo[index].height = height;
+  g_surfaceInfo[index].format = format;
+  g_surfaceInfo[index].usage = usage;
+  g_surfaceInfo[index].pool = pool;
+  g_surfaceInfo[index].fromTexture = fromTexture;
+  return &g_surfaceInfo[index];
+}
+
+SurfaceInfo* EnsureSurfaceInfo(IDirect3DSurface9* surface, bool fromTexture) {
+  const SurfaceInfo* existing = FindSurfaceInfo(surface);
+  if (existing != nullptr) {
+    return const_cast<SurfaceInfo*>(existing);
+  }
+
+  if (surface == nullptr) {
+    return nullptr;
+  }
+
+  D3DSURFACE_DESC desc = {};
+  if (FAILED(surface->GetDesc(&desc))) {
+    return nullptr;
+  }
+
+  return RegisterSurface(
+      surface,
+      nullptr,
+      desc.Width,
+      desc.Height,
+      desc.Format,
+      desc.Usage,
+      desc.Pool,
+      fromTexture);
+}
+
+const TextureInfo* FindTextureInfo(IDirect3DBaseTexture9* texture) {
+  if (texture == nullptr) {
+    return nullptr;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_textureInfo) / sizeof(g_textureInfo[0]));
+  const LONG count = ClampedCount(&g_textureInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_textureInfo[i].texture == texture) {
+      return &g_textureInfo[i];
+    }
+  }
+
+  return nullptr;
+}
+
+TextureInfo* FindMutableTextureInfo(IDirect3DBaseTexture9* texture) {
+  if (texture == nullptr) {
+    return nullptr;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_textureInfo) / sizeof(g_textureInfo[0]));
+  const LONG count = ClampedCount(&g_textureInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_textureInfo[i].texture == texture) {
+      return &g_textureInfo[i];
+    }
+  }
+
+  return nullptr;
+}
+
+bool IsRenderTargetTexture(IDirect3DBaseTexture9* texture) {
+  const TextureInfo* info = FindTextureInfo(texture);
+  return info != nullptr && IsRenderTargetUsage(info->usage);
+}
+
+RtTextureUsageInfo* FindRtTextureUsageInfo(IDirect3DBaseTexture9* texture) {
+  if (texture == nullptr) {
+    return nullptr;
+  }
+
+  const LONG maxCount =
+      static_cast<LONG>(sizeof(g_rtTextureUsageInfo) / sizeof(g_rtTextureUsageInfo[0]));
+  const LONG count = ClampedCount(&g_rtTextureUsageInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_rtTextureUsageInfo[i].texture == texture) {
+      return &g_rtTextureUsageInfo[i];
+    }
+  }
+
+  return nullptr;
+}
+
+RtTextureUsageInfo* EnsureRtTextureUsageInfo(IDirect3DBaseTexture9* texture) {
+  RtTextureUsageInfo* existing = FindRtTextureUsageInfo(texture);
+  if (existing != nullptr || texture == nullptr) {
+    return existing;
+  }
+
+  const LONG maxCount =
+      static_cast<LONG>(sizeof(g_rtTextureUsageInfo) / sizeof(g_rtTextureUsageInfo[0]));
+  const LONG count = ClampedCount(&g_rtTextureUsageInfoCount, maxCount);
+  LONG freeIndex = -1;
+  for (LONG i = 0; i < count; ++i) {
+    if (g_rtTextureUsageInfo[i].texture == nullptr) {
+      freeIndex = i;
+      break;
+    }
+  }
+
+  LONG index = freeIndex;
+  if (index < 0) {
+    if (count >= maxCount) {
+      return nullptr;
+    }
+    index = InterlockedIncrement(const_cast<LONG*>(&g_rtTextureUsageInfoCount)) - 1;
+  }
+  if (index < 0 || index >= maxCount) {
+    return nullptr;
+  }
+
+  g_rtTextureUsageInfo[index].texture = texture;
+  g_rtTextureUsageInfo[index].containsScreenSpaceUi = false;
+  g_rtTextureUsageInfo[index].uiDraws = 0;
+  g_rtTextureUsageInfo[index].nativeTargetSets = 0;
+  g_rtTextureUsageInfo[index].allowedComposites = 0;
+  return &g_rtTextureUsageInfo[index];
+}
+
+void RemoveRtTextureUsageInfo(IDirect3DBaseTexture9* texture) {
+  RtTextureUsageInfo* usage = FindRtTextureUsageInfo(texture);
+  if (usage == nullptr) {
+    return;
+  }
+
+  usage->texture = nullptr;
+  usage->containsScreenSpaceUi = false;
+  usage->uiDraws = 0;
+  usage->nativeTargetSets = 0;
+  usage->allowedComposites = 0;
+}
+
+bool IsBehaviorMarkableUiRenderTargetSurface(const SurfaceInfo* info) {
+  if (!kAllowBehaviorMarkedUiRenderTargets || !IsColorRenderTargetTextureSurface(info) ||
+      info->ownerTexture == nullptr) {
+    return false;
+  }
+
+  if (!kPromoteFullSizeBehaviorMarkedUiRenderTargets && IsFullSizeSceneRenderTarget(info)) {
+    return false;
+  }
+
+  return true;
+}
+
+bool IsBehaviorMarkedUiRenderTargetSurface(const SurfaceInfo* info) {
+  if (!IsBehaviorMarkableUiRenderTargetSurface(info)) {
+    return false;
+  }
+
+  const RtTextureUsageInfo* usage = FindRtTextureUsageInfo(info->ownerTexture);
+  return usage != nullptr && usage->containsScreenSpaceUi;
+}
+
+bool IsNativeUiRenderTargetCompositeTexture(IDirect3DBaseTexture9* texture) {
+  const TextureInfo* info = FindTextureInfo(texture);
+  if (info == nullptr || !IsRenderTargetUsage(info->usage)) {
+    return false;
+  }
+
+  if (!kPromoteFullSizeBehaviorMarkedUiRenderTargets && info->width >= 2000 &&
+      info->height >= 1000 && info->format == D3DFMT_A8R8G8B8) {
+    return false;
+  }
+
+  const RtTextureUsageInfo* usage = FindRtTextureUsageInfo(texture);
+  return usage != nullptr && usage->containsScreenSpaceUi && usage->nativeTargetSets > 0;
+}
+
+DWORD MakeFourCc(char a, char b, char c, char d) {
+  return static_cast<DWORD>(static_cast<BYTE>(a)) |
+      (static_cast<DWORD>(static_cast<BYTE>(b)) << 8) |
+      (static_cast<DWORD>(static_cast<BYTE>(c)) << 16) |
+      (static_cast<DWORD>(static_cast<BYTE>(d)) << 24);
+}
+
+const char* CandidateRoleName(DWORD roleBits) {
+  if ((roleBits & kCandidateRoleVideo) != 0) {
+    return "video_candidate";
+  }
+  if ((roleBits & kCandidateRoleHud) != 0) {
+    return "hud_candidate";
+  }
+  if ((roleBits & kCandidateRoleUi) != 0) {
+    return "ui_candidate";
+  }
+  if ((roleBits & kCandidateRoleEffect) != 0) {
+    return "effect_candidate";
+  }
+  if ((roleBits & kCandidateRoleWorldUnshadowed) != 0) {
+    return "world_unshadowed_candidate";
+  }
+  if ((roleBits & kCandidateRoleWorld) != 0) {
+    return "world_candidate";
+  }
+  return "unknown";
+}
+
+bool ReadTextureLevel0Packed(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    BYTE** packedData,
+    SIZE_T* packedSize,
+    UINT* outRowBytes,
+    UINT* outRowCount) {
+  if (texture == nullptr || info == nullptr || packedData == nullptr || packedSize == nullptr ||
+      g_origTextureLockRect == nullptr || g_origTextureUnlockRect == nullptr) {
+    return false;
+  }
+
+  UINT rowBytes = 0;
+  UINT rowCount = 0;
+  if (!ComputeTextureCopyLayout(info->format, info->width, info->height, &rowBytes, &rowCount)) {
+    return false;
+  }
+
+  IDirect3DTexture9* texture2D = static_cast<IDirect3DTexture9*>(texture);
+  D3DLOCKED_RECT locked = {};
+  const HRESULT lockResult =
+      g_origTextureLockRect(texture2D, 0, &locked, nullptr, D3DLOCK_READONLY);
+  if (FAILED(lockResult) || locked.pBits == nullptr) {
+    return false;
+  }
+
+  if (locked.Pitch <= 0 || static_cast<UINT>(locked.Pitch) < rowBytes) {
+    g_origTextureUnlockRect(texture2D, 0);
+    return false;
+  }
+
+  const UINT packedRowBytes = (rowBytes + 3u) & ~3u;
+  const SIZE_T levelDataSize = static_cast<SIZE_T>(packedRowBytes) * rowCount;
+  if (levelDataSize == 0 || levelDataSize > (64u * 1024u * 1024u)) {
+    g_origTextureUnlockRect(texture2D, 0);
+    return false;
+  }
+
+  BYTE* packed = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, levelDataSize));
+  if (packed == nullptr) {
+    g_origTextureUnlockRect(texture2D, 0);
+    return false;
+  }
+
+  const BYTE* base = static_cast<const BYTE*>(locked.pBits);
+
+  for (UINT y = 0; y < rowCount; ++y) {
+    const BYTE* row = base + static_cast<int>(y) * locked.Pitch;
+    CopyMemory(packed + static_cast<SIZE_T>(y) * packedRowBytes, row, rowBytes);
+  }
+
+  g_origTextureUnlockRect(texture2D, 0);
+  *packedData = packed;
+  *packedSize = levelDataSize;
+  if (outRowBytes != nullptr) {
+    *outRowBytes = rowBytes;
+  }
+  if (outRowCount != nullptr) {
+    *outRowCount = rowCount;
+  }
+  return true;
+}
+
+bool ComputeRtxTextureHash(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long* rtxHash) {
+  if (rtxHash == nullptr) {
+    return false;
+  }
+
+  BYTE* packed = nullptr;
+  SIZE_T packedSize = 0;
+  if (!ReadTextureLevel0Packed(texture, info, &packed, &packedSize, nullptr, nullptr)) {
+    return false;
+  }
+
+  *rtxHash = XXH3_64bits(packed, packedSize);
+  HeapFree(GetProcessHeap(), 0, packed);
+  return true;
+}
+
+bool TryGetCachedRtxTextureHash(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long* outHash,
+    bool* outConfiguredUi) {
+  if (outHash != nullptr) {
+    *outHash = 0;
+  }
+  if (outConfiguredUi != nullptr) {
+    *outConfiguredUi = false;
+  }
+
+  if (texture == nullptr || info == nullptr) {
+    return false;
+  }
+
+  TextureInfo* mutableInfo = FindMutableTextureInfo(texture);
+  if (mutableInfo == nullptr) {
+    return false;
+  }
+
+  if (!mutableInfo->rtxHashAttempted) {
+    unsigned long long hash = 0;
+    mutableInfo->rtxHashAttempted = true;
+    mutableInfo->rtxHashValid = ComputeRtxTextureHash(texture, info, &hash);
+    if (mutableInfo->rtxHashValid) {
+      mutableInfo->rtxHash = hash;
+      mutableInfo->configuredUiTexture = ConfiguredUiTextureHashContains(hash);
+    } else {
+      mutableInfo->rtxHash = 0;
+      mutableInfo->configuredUiTexture = false;
+    }
+  }
+
+  if (!mutableInfo->rtxHashValid) {
+    return false;
+  }
+
+  if (outHash != nullptr) {
+    *outHash = mutableInfo->rtxHash;
+  }
+  if (outConfiguredUi != nullptr) {
+    *outConfiguredUi = mutableInfo->configuredUiTexture;
+  }
+
+  if (mutableInfo->configuredUiTexture) {
+    const LONG hits = InterlockedIncrement(const_cast<LONG*>(&g_configuredUiTextureHashHits));
+    if (hits <= 40 || (hits % 500) == 0) {
+      Log(
+          "configured RTX UI texture hash hit #%ld: tex=%p hash=0x%016llX "
+          "info=%ux%u/%s levels=%u pool=%u",
+          hits,
+          texture,
+          mutableInfo->rtxHash,
+          mutableInfo->width,
+          mutableInfo->height,
+          FormatName(mutableInfo->format),
+          mutableInfo->levels,
+          static_cast<unsigned>(mutableInfo->pool));
+    }
+  }
+
+  return true;
+}
+
+bool FillDdsHeader(const TextureInfo* info, UINT rowBytes, UINT rowCount, DdsHeader* header) {
+  if (info == nullptr || header == nullptr) {
+    return false;
+  }
+
+  *header = {};
+  header->size = 124;
+  header->flags = kDdsdCaps | kDdsdHeight | kDdsdWidth | kDdsdPixelFormat;
+  header->height = info->height;
+  header->width = info->width;
+  header->pixelFormat.size = 32;
+  header->caps = kDdsCapsTexture;
+
+  switch (info->format) {
+    case D3DFMT_DXT1:
+      header->flags |= kDdsdLinearSize;
+      header->pitchOrLinearSize = rowBytes * rowCount;
+      header->pixelFormat.flags = kDdpfFourCc;
+      header->pixelFormat.fourCc = MakeFourCc('D', 'X', 'T', '1');
+      return true;
+    case D3DFMT_DXT3:
+      header->flags |= kDdsdLinearSize;
+      header->pitchOrLinearSize = rowBytes * rowCount;
+      header->pixelFormat.flags = kDdpfFourCc;
+      header->pixelFormat.fourCc = MakeFourCc('D', 'X', 'T', '3');
+      return true;
+    case D3DFMT_DXT5:
+      header->flags |= kDdsdLinearSize;
+      header->pitchOrLinearSize = rowBytes * rowCount;
+      header->pixelFormat.flags = kDdpfFourCc;
+      header->pixelFormat.fourCc = MakeFourCc('D', 'X', 'T', '5');
+      return true;
+    case D3DFMT_A8R8G8B8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfRgb | kDdpfAlphaPixels;
+      header->pixelFormat.rgbBitCount = 32;
+      header->pixelFormat.rBitMask = 0x00FF0000u;
+      header->pixelFormat.gBitMask = 0x0000FF00u;
+      header->pixelFormat.bBitMask = 0x000000FFu;
+      header->pixelFormat.aBitMask = 0xFF000000u;
+      return true;
+    case D3DFMT_X8R8G8B8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfRgb;
+      header->pixelFormat.rgbBitCount = 32;
+      header->pixelFormat.rBitMask = 0x00FF0000u;
+      header->pixelFormat.gBitMask = 0x0000FF00u;
+      header->pixelFormat.bBitMask = 0x000000FFu;
+      return true;
+    case D3DFMT_A8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfAlpha;
+      header->pixelFormat.rgbBitCount = 8;
+      header->pixelFormat.aBitMask = 0x000000FFu;
+      return true;
+    case D3DFMT_L8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfLuminance;
+      header->pixelFormat.rgbBitCount = 8;
+      header->pixelFormat.rBitMask = 0x000000FFu;
+      return true;
+    case D3DFMT_A8L8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfLuminance | kDdpfAlphaPixels;
+      header->pixelFormat.rgbBitCount = 16;
+      header->pixelFormat.rBitMask = 0x000000FFu;
+      header->pixelFormat.aBitMask = 0x0000FF00u;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void DumpTextureCandidateDds(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long rtxHash,
+    const char* roleName,
+    const char* dumpDir) {
+  if (texture == nullptr || info == nullptr || roleName == nullptr) {
+    return;
+  }
+
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_textureCandidateDumps), 0, 0) >=
+      kMaxTextureCandidateDumps) {
+    return;
+  }
+
+  BYTE* packed = nullptr;
+  SIZE_T packedSize = 0;
+  UINT rowBytes = 0;
+  UINT rowCount = 0;
+  if (!ReadTextureLevel0Packed(texture, info, &packed, &packedSize, &rowBytes, &rowCount)) {
+    return;
+  }
+
+  DdsHeader header = {};
+  if (!FillDdsHeader(info, rowBytes, rowCount, &header)) {
+    HeapFree(GetProcessHeap(), 0, packed);
+    return;
+  }
+
+  const char* targetDir = dumpDir != nullptr && dumpDir[0] != '\0'
+      ? dumpDir
+      : (g_candidateTextureDumpDir[0] != '\0' ? g_candidateTextureDumpDir
+                                              : "rtx-remix\\logs\\tod-candidate-textures");
+
+  char path[MAX_PATH * 3] = {};
+  snprintf(
+      path,
+      sizeof(path),
+      "%s\\%s_%016llX_%ux%u_%s.dds",
+      targetDir,
+      roleName,
+      rtxHash,
+      info->width,
+      info->height,
+      FormatName(info->format));
+
+  if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+    HeapFree(GetProcessHeap(), 0, packed);
+    return;
+  }
+
+  LockLog();
+  EnsureLogDirectory();
+  HANDLE file = CreateFileA(
+      path,
+      GENERIC_WRITE,
+      FILE_SHARE_READ,
+      nullptr,
+      CREATE_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    const DWORD magic = MakeFourCc('D', 'D', 'S', ' ');
+    WriteFile(file, &magic, sizeof(magic), &written, nullptr);
+    WriteFile(file, &header, sizeof(header), &written, nullptr);
+    WriteFile(file, packed, static_cast<DWORD>(packedSize), &written, nullptr);
+    CloseHandle(file);
+    InterlockedIncrement(const_cast<LONG*>(&g_textureCandidateDumps));
+  }
+  UnlockLog();
+
+  HeapFree(GetProcessHeap(), 0, packed);
+}
+
+bool TextureCandidateAlreadyLogged(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    DWORD roleBits,
+    unsigned long long rtxHash,
+    bool compareHash) {
+  if (texture == nullptr || info == nullptr) {
+    return true;
+  }
+
+  const LONG maxCount =
+      static_cast<LONG>(sizeof(g_textureCandidateInfo) / sizeof(g_textureCandidateInfo[0]));
+  const LONG count = ClampedCount(&g_textureCandidateInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    const TextureCandidateInfo& candidate = g_textureCandidateInfo[i];
+    if (candidate.texture == texture && candidate.width == info->width &&
+        candidate.height == info->height && candidate.levels == info->levels &&
+        candidate.format == info->format && candidate.usage == info->usage &&
+        candidate.pool == info->pool && (candidate.roleBits & roleBits) == roleBits &&
+        (!compareHash || candidate.rtxHash == rtxHash)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+bool RegisterTextureCandidate(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    DWORD roleBits,
+    unsigned long long rtxHash) {
+  if (texture == nullptr || info == nullptr || roleBits == 0) {
+    return false;
+  }
+
+  const LONG maxCount =
+      static_cast<LONG>(sizeof(g_textureCandidateInfo) / sizeof(g_textureCandidateInfo[0]));
+  LONG count = ClampedCount(&g_textureCandidateInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    TextureCandidateInfo& candidate = g_textureCandidateInfo[i];
+    if (candidate.texture == texture && candidate.width == info->width &&
+        candidate.height == info->height && candidate.levels == info->levels &&
+        candidate.format == info->format && candidate.usage == info->usage &&
+        candidate.pool == info->pool && candidate.rtxHash == rtxHash) {
+      const DWORD missingRoles = roleBits & ~candidate.roleBits;
+      candidate.roleBits |= roleBits;
+      return missingRoles != 0;
+    }
+  }
+
+  if (count >= maxCount) {
+    return false;
+  }
+
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_textureCandidateInfoCount)) - 1;
+  if (index < 0 || index >= maxCount) {
+    return false;
+  }
+
+  g_textureCandidateInfo[index].texture = texture;
+  g_textureCandidateInfo[index].width = info->width;
+  g_textureCandidateInfo[index].height = info->height;
+  g_textureCandidateInfo[index].levels = info->levels;
+  g_textureCandidateInfo[index].format = info->format;
+  g_textureCandidateInfo[index].usage = info->usage;
+  g_textureCandidateInfo[index].pool = info->pool;
+  g_textureCandidateInfo[index].roleBits = roleBits;
+  g_textureCandidateInfo[index].rtxHash = rtxHash;
+  return true;
+}
+
+void AppendTextureCandidateRow(
+    const char* roleName,
+    DWORD roleBits,
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long rtxHash,
+    const char* drawName,
+    LONG drawCount,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount,
+    UINT vertexCount,
+    const LayoutState& layout) {
+  if (roleName == nullptr || info == nullptr) {
+    return;
+  }
+
+  const SurfaceInfo* rtInfo = FindSurfaceInfo(g_currentRenderTarget0);
+  const bool projOrtho =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_haveProjection), 0, 0) != 0 &&
+      IsOrthographicProjection(g_lastProjection);
+  const LONG frameDrawIndex = InterlockedCompareExchange(const_cast<LONG*>(&g_frameDrawIndex), 0, 0);
+  const bool worldDrawn =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_worldDrawnThisFrame), 0, 0) != 0;
+
+  SYSTEMTIME st = {};
+  GetLocalTime(&st);
+
+  char line[1536] = {};
+  const int count = snprintf(
+      line,
+      sizeof(line),
+      "%04u-%02u-%02u %02u:%02u:%02u.%03u\t%s\t0x%08lx\t%s\t%ld\t%u\t%u\t%u\t"
+      "%p\t0x%016llX\t%u\t%u\t%s\t%u\t0x%08lx\t%u\t0x%08lx\t%d\t%d\t%d\t%d\t"
+      "%p\t%u\t%u\t%s\t%d\t%lu\t%lu\t%lu\t%lu\t%lu\t%lu\t%d\t%ld\t%d\t%d\r\n",
+      st.wYear,
+      st.wMonth,
+      st.wDay,
+      st.wHour,
+      st.wMinute,
+      st.wSecond,
+      st.wMilliseconds,
+      roleName,
+      roleBits,
+      drawName != nullptr ? drawName : "draw",
+      drawCount,
+      static_cast<unsigned>(primitiveType),
+      primitiveCount,
+      vertexCount,
+      texture,
+      rtxHash,
+      info->width,
+      info->height,
+      FormatName(info->format),
+      info->levels,
+      info->usage,
+      static_cast<unsigned>(info->pool),
+      layout.fvf,
+      layout.fvfRhw ? 1 : 0,
+      layout.declarationPositionT ? 1 : 0,
+      layout.shaderActive ? 1 : 0,
+      layout.unknown ? 1 : 0,
+      g_currentRenderTarget0,
+      rtInfo != nullptr ? rtInfo->width : 0,
+      rtInfo != nullptr ? rtInfo->height : 0,
+      rtInfo != nullptr ? FormatName(rtInfo->format) : "unknown",
+      rtInfo != nullptr && rtInfo->fromTexture ? 1 : 0,
+      g_rsZEnable,
+      g_rsZWriteEnable,
+      g_rsAlphaBlendEnable,
+      g_rsAlphaTestEnable,
+      g_rsLighting,
+      g_rsFogEnable,
+      IsBehaviorOverlayDraw(layout) ? 1 : 0,
+      frameDrawIndex,
+      projOrtho ? 1 : 0,
+      worldDrawn ? 1 : 0);
+  if (count <= 0) {
+    return;
+  }
+
+  LockLog();
+  EnsureLogDirectory();
+
+  // The first row of each process truncates the file and writes the header, so a
+  // run never inherits a stale schema from a previous build's TSV. Later rows
+  // append. (The TSV is regenerated every run; the analyzer reads it by column
+  // name, so a consistent single header per file is required.)
+  const bool writeHeader =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCandidateHeaderWritten), 1, 0) == 0;
+  const char* path =
+      g_candidatePath[0] != '\0' ? g_candidatePath : "rtx-remix\\logs\\tod-remix-candidates.tsv";
+  HANDLE file = CreateFileA(
+      path,
+      writeHeader ? GENERIC_WRITE : FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      writeHeader ? CREATE_ALWAYS : OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+
+  if (file != INVALID_HANDLE_VALUE) {
+    if (writeHeader) {
+      const char* header =
+          "time\trole\troleBits\tdraw\tdrawCount\tprimitiveType\tprimitiveCount\tvertexCount\t"
+          "texture\trtxTextureHash\twidth\theight\tformat\tlevels\tusage\tpool\tfvf\t"
+          "fvfRhw\tdeclPositionT\tshaderActive\tunknownLayout\trt0\trtWidth\trtHeight\t"
+          "rtFormat\trtFromTexture\tzEnable\tzWriteEnable\talphaBlendEnable\t"
+          "alphaTestEnable\tlighting\tfogEnable\toverlayState\tframeDrawIndex\tprojOrtho\t"
+          "worldDrawn\r\n";
+      DWORD headerWritten = 0;
+      WriteFile(file, header, static_cast<DWORD>(strlen(header)), &headerWritten, nullptr);
+    }
+
+    DWORD written = 0;
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+}
+
+void LogTextureCandidateForDraw(
+    const char* drawName,
+    LONG drawCount,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount,
+    UINT vertexCount,
+    const LayoutState& layout) {
+  if (!kEnableCandidateDiscovery) {
+    return;
+  }
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_textureCandidateRows), 0, 0) >= 2048) {
+    return;
+  }
+
+  IDirect3DBaseTexture9* sourceTexture = g_sourceTextureStages[0];
+  const TextureInfo* sourceInfo = FindTextureInfo(sourceTexture);
+  if (!IsManagedRegularTexture(sourceInfo) || !IsSupportedShadowFormat(sourceInfo->format)) {
+    return;
+  }
+
+  const bool preTransformed = layout.fvfRhw || layout.declarationPositionT;
+  const bool fixedFunctionOverlay = IsFixedFunctionOverlayDraw(layout);
+  const bool likelyVideo =
+      preTransformed && sourceInfo->format == D3DFMT_A8R8G8B8 &&
+      sourceInfo->width >= 512 && sourceInfo->height >= 256 && sourceInfo->levels == 1;
+
+  unsigned long long rtxHash = 0;
+  bool configuredUi = false;
+  if (!TryGetCachedRtxTextureHash(sourceTexture, sourceInfo, &rtxHash, &configuredUi)) {
+    return;
+  }
+
+  const bool worldDrawnThisFrame =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_worldDrawnThisFrame), 0, 0) != 0;
+
+  DWORD roleBits = 0;
+  if (configuredUi) {
+    roleBits |= kCandidateRoleUi;
+  } else if (likelyVideo) {
+    roleBits |= kCandidateRoleVideo;
+  } else if (preTransformed) {
+    // Screen-space draws split by frame ordering: the in-game HUD is the RHW layer
+    // drawn after the 3D world, while menu/fullscreen UI is drawn before any world.
+    roleBits |= worldDrawnThisFrame ? kCandidateRoleHud : kCandidateRoleUi;
+  } else if (fixedFunctionOverlay) {
+    roleBits |= kCandidateRoleEffect;
+  } else {
+    // 3D fixed-function world geometry. Captured so distant LOD / billboard
+    // atlases that Remix mis-reconstructs (the mission-3 spikes) can be picked
+    // out of the contact sheet and hidden via rtx.hideInstanceTextures in the
+    // Remix config. The unshadowed sub-flag is kept for the existing report.
+    roleBits |= kCandidateRoleWorld;
+    if (!ShouldShadowTextureForDraw(sourceTexture, sourceInfo, layout)) {
+      roleBits |= kCandidateRoleWorldUnshadowed;
+    }
+  }
+
+  if (roleBits == 0) {
+    return;
+  }
+
+  if (TextureCandidateAlreadyLogged(sourceTexture, sourceInfo, roleBits, rtxHash, true)) {
+    return;
+  }
+
+  if (!RegisterTextureCandidate(sourceTexture, sourceInfo, roleBits, rtxHash)) {
+    return;
+  }
+
+  const LONG rows = InterlockedIncrement(const_cast<LONG*>(&g_textureCandidateRows));
+  if (rows > 2048) {
+    return;
+  }
+
+  if ((roleBits & kCandidateRoleHud) != 0) {
+    InterlockedIncrement(const_cast<LONG*>(&g_hudCandidateRows));
+    DumpTextureCandidateDds(
+        sourceTexture, sourceInfo, rtxHash, CandidateRoleName(roleBits), g_hudCandidateTextureDumpDir);
+  } else if ((roleBits & kCandidateRoleUi) != 0) {
+    DumpTextureCandidateDds(
+        sourceTexture, sourceInfo, rtxHash, CandidateRoleName(roleBits), g_candidateTextureDumpDir);
+  } else if ((roleBits & kCandidateRoleWorld) != 0) {
+    DumpTextureCandidateDds(
+        sourceTexture, sourceInfo, rtxHash, CandidateRoleName(roleBits), g_worldCandidateTextureDumpDir);
+  }
+
+  AppendTextureCandidateRow(
+      CandidateRoleName(roleBits),
+      roleBits,
+      sourceTexture,
+      sourceInfo,
+      rtxHash,
+      drawName,
+      drawCount,
+      primitiveType,
+      primitiveCount,
+      vertexCount,
+      layout);
+}
+
+bool IsLikelyVideoSourceTexture(const TextureInfo* sourceInfo, const LayoutState& layout) {
+  const bool preTransformed = layout.fvfRhw || layout.declarationPositionT;
+  return preTransformed && sourceInfo != nullptr && sourceInfo->format == D3DFMT_A8R8G8B8 &&
+      sourceInfo->width >= 512 && sourceInfo->height >= 256 && sourceInfo->levels == 1;
+}
+
+void MarkRequestedRenderTargetUiDraw(
+    const LayoutState& layout,
+    const char* drawName,
+    LONG drawCount,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount) {
+  if (!IsBehaviorOverlayDraw(layout)) {
+    return;
+  }
+
+  const SurfaceInfo* requestedInfo = FindSurfaceInfo(g_requestedRenderTarget0);
+  if (!IsBehaviorMarkableUiRenderTargetSurface(requestedInfo)) {
+    return;
+  }
+
+  IDirect3DBaseTexture9* sourceTexture = g_sourceTextureStages[0];
+  const TextureInfo* sourceInfo = FindTextureInfo(sourceTexture);
+  if (!IsManagedRegularTexture(sourceInfo) || !IsSupportedShadowFormat(sourceInfo->format) ||
+      IsRenderTargetUsage(sourceInfo->usage) || IsLikelyVideoSourceTexture(sourceInfo, layout)) {
+    return;
+  }
+
+  RtTextureUsageInfo* usage = EnsureRtTextureUsageInfo(requestedInfo->ownerTexture);
+  if (usage == nullptr) {
+    return;
+  }
+
+  const bool firstMark = !usage->containsScreenSpaceUi;
+  usage->containsScreenSpaceUi = true;
+  const LONG targetUiDraws = InterlockedIncrement(&usage->uiDraws);
+  const LONG marked = InterlockedIncrement(const_cast<LONG*>(&g_markedUiRtDraws));
+
+  if (firstMark || marked <= 40 || (marked % 500) == 0) {
+    Log(
+        "marked behavior UI RT draw #%ld targetDraws=%ld: draw=%s #%ld primType=%u "
+        "primCount=%u requestedRT=%p targetTex=%p targetInfo=%ux%u/%s redirectedNow=%d "
+        "source=%p sourceInfo=%ux%u/%s sourceUsage=0x%08lx sourcePool=%u sourceLevels=%u",
+        marked,
+        targetUiDraws,
+        drawName != nullptr ? drawName : "draw",
+        drawCount,
+        static_cast<unsigned>(primitiveType),
+        primitiveCount,
+        g_requestedRenderTarget0,
+        requestedInfo->ownerTexture,
+        requestedInfo->width,
+        requestedInfo->height,
+        FormatName(requestedInfo->format),
+        g_currentRenderTarget0Redirected ? 1 : 0,
+        sourceTexture,
+        sourceInfo->width,
+        sourceInfo->height,
+        FormatName(sourceInfo->format),
+        sourceInfo->usage,
+        static_cast<unsigned>(sourceInfo->pool),
+        sourceInfo->levels);
+  }
+}
+
+TextureCopyInfo* FindTextureCopyInfo(IDirect3DBaseTexture9* texture) {
+  if (texture == nullptr) {
+    return nullptr;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_textureCopyInfo) / sizeof(g_textureCopyInfo[0]));
+  const LONG count = ClampedCount(&g_textureCopyInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_textureCopyInfo[i].source == texture) {
+      return &g_textureCopyInfo[i];
+    }
+  }
+
+  return nullptr;
+}
+
+TextureCopyInfo* EnsureTextureCopyInfo(IDirect3DBaseTexture9* texture) {
+  TextureCopyInfo* existing = FindTextureCopyInfo(texture);
+  if (existing != nullptr || texture == nullptr) {
+    return existing;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_textureCopyInfo) / sizeof(g_textureCopyInfo[0]));
+  const LONG count = ClampedCount(&g_textureCopyInfoCount, maxCount);
+  LONG index = -1;
+  for (LONG i = 0; i < count; ++i) {
+    if (g_textureCopyInfo[i].source == nullptr) {
+      index = i;
+      break;
+    }
+  }
+
+  if (index < 0) {
+    if (count >= maxCount) {
+      return nullptr;
+    }
+    index = InterlockedIncrement(const_cast<LONG*>(&g_textureCopyInfoCount)) - 1;
+  }
+  if (index < 0 || index >= maxCount) {
+    return nullptr;
+  }
+
+  g_textureCopyInfo[index].source = texture;
+  g_textureCopyInfo[index].staging = nullptr;
+  g_textureCopyInfo[index].replacement = nullptr;
+  g_textureCopyInfo[index].width = 0;
+  g_textureCopyInfo[index].height = 0;
+  g_textureCopyInfo[index].levels = 0;
+  g_textureCopyInfo[index].format = D3DFMT_UNKNOWN;
+  g_textureCopyInfo[index].dirtyLevels = 0xFFFFFFFFul;
+  g_textureCopyInfo[index].writeLockedLevels = 0;
+  g_textureCopyInfo[index].attempted = false;
+  g_textureCopyInfo[index].dirty = true;
+  g_textureCopyInfo[index].uploaded = false;
+  return &g_textureCopyInfo[index];
+}
+
+DWORD TextureLevelMask(UINT level) {
+  if (level >= 32) {
+    return 0xFFFFFFFFul;
+  }
+
+  return 1ul << level;
+}
+
+void MarkTextureDirty(IDirect3DTexture9* texture, UINT level, const char* reason) {
+  if (texture == nullptr) {
+    return;
+  }
+
+  const TextureInfo* info = FindTextureInfo(texture);
+  if (!ShouldCreateDefaultTextureCopy(info)) {
+    return;
+  }
+
+  TextureCopyInfo* copyInfo = EnsureTextureCopyInfo(texture);
+  if (copyInfo == nullptr) {
+    return;
+  }
+
+  TextureInfo* mutableInfo = FindMutableTextureInfo(texture);
+  if (mutableInfo != nullptr) {
+    mutableInfo->rtxHashAttempted = false;
+    mutableInfo->rtxHashValid = false;
+    mutableInfo->configuredUiTexture = false;
+    mutableInfo->rtxHash = 0;
+  }
+
+  const DWORD mask = TextureLevelMask(level);
+  copyInfo->dirty = true;
+  copyInfo->dirtyLevels |= mask;
+
+  const LONG dirty = InterlockedIncrement(const_cast<LONG*>(&g_textureDirtyMarks));
+  if (dirty <= 80 || (dirty % 1000) == 0) {
+    Log(
+        "managed texture dirty #%ld: tex=%p level=%u mask=0x%08lx reason=%s "
+        "info=%ux%u/%s pool=%u uploaded=%d",
+        dirty,
+        texture,
+        level,
+        mask,
+        reason != nullptr ? reason : "unknown",
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? static_cast<unsigned>(info->pool) : 0,
+        copyInfo->uploaded ? 1 : 0);
+  }
+}
+
+void RemoveTextureInfo(IDirect3DBaseTexture9* texture) {
+  if (texture == nullptr) {
+    return;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_textureInfo) / sizeof(g_textureInfo[0]));
+  const LONG count = ClampedCount(&g_textureInfoCount, maxCount);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_textureInfo[i].texture == texture) {
+      g_textureInfo[i].texture = nullptr;
+      g_textureInfo[i].level0Surface = nullptr;
+      g_textureInfo[i].width = 0;
+      g_textureInfo[i].height = 0;
+      g_textureInfo[i].levels = 0;
+      g_textureInfo[i].format = D3DFMT_UNKNOWN;
+      g_textureInfo[i].usage = 0;
+      g_textureInfo[i].pool = D3DPOOL_DEFAULT;
+      g_textureInfo[i].rtxHashAttempted = false;
+      g_textureInfo[i].rtxHashValid = false;
+      g_textureInfo[i].configuredUiTexture = false;
+      g_textureInfo[i].rtxHash = 0;
+      return;
+    }
+  }
+}
+
+void ResetTextureCopyInfo(TextureCopyInfo* copyInfo, bool releaseObjects, bool clearSource) {
+  if (copyInfo == nullptr) {
+    return;
+  }
+
+  IDirect3DTexture9* staging = copyInfo->staging;
+  IDirect3DBaseTexture9* replacement = copyInfo->replacement;
+
+  copyInfo->staging = nullptr;
+  copyInfo->replacement = nullptr;
+  copyInfo->width = 0;
+  copyInfo->height = 0;
+  copyInfo->levels = 0;
+  copyInfo->format = D3DFMT_UNKNOWN;
+  copyInfo->dirtyLevels = 0xFFFFFFFFul;
+  copyInfo->writeLockedLevels = 0;
+  copyInfo->attempted = false;
+  copyInfo->dirty = true;
+  copyInfo->uploaded = false;
+  if (clearSource) {
+    copyInfo->source = nullptr;
+  }
+
+  if (releaseObjects) {
+    if (staging != nullptr) {
+      staging->Release();
+    }
+    if (replacement != nullptr) {
+      replacement->Release();
+    }
+  }
+}
+
+bool TextureCopyDescriptorMatches(
+    const TextureCopyInfo* copyInfo,
+    const D3DSURFACE_DESC& desc,
+    UINT levels) {
+  return copyInfo != nullptr && copyInfo->width == desc.Width &&
+      copyInfo->height == desc.Height && copyInfo->levels == levels &&
+      copyInfo->format == desc.Format;
+}
+
+void RegisterTexture(
+    IDirect3DBaseTexture9* texture,
+    IDirect3DSurface9* level0Surface,
+    UINT width,
+    UINT height,
+    UINT levels,
+    D3DFORMAT format,
+    DWORD usage,
+    D3DPOOL pool) {
+  if (texture == nullptr) {
+    return;
+  }
+
+  const LONG maxCount = static_cast<LONG>(sizeof(g_textureInfo) / sizeof(g_textureInfo[0]));
+  LONG count = ClampedCount(&g_textureInfoCount, maxCount);
+  LONG freeIndex = -1;
+  for (LONG i = 0; i < count; ++i) {
+    if (g_textureInfo[i].texture == texture) {
+      g_textureInfo[i].level0Surface = level0Surface;
+      g_textureInfo[i].width = width;
+      g_textureInfo[i].height = height;
+      g_textureInfo[i].levels = levels;
+      g_textureInfo[i].format = format;
+      g_textureInfo[i].usage = usage;
+      g_textureInfo[i].pool = pool;
+      g_textureInfo[i].rtxHashAttempted = false;
+      g_textureInfo[i].rtxHashValid = false;
+      g_textureInfo[i].configuredUiTexture = false;
+      g_textureInfo[i].rtxHash = 0;
+      return;
+    }
+    if (g_textureInfo[i].texture == nullptr && freeIndex < 0) {
+      freeIndex = i;
+    }
+  }
+
+  LONG index = freeIndex;
+  if (index < 0) {
+    if (count >= maxCount) {
+      return;
+    }
+    index = InterlockedIncrement(const_cast<LONG*>(&g_textureInfoCount)) - 1;
+  }
+  if (index < 0 || index >= maxCount) {
+    return;
+  }
+
+  g_textureInfo[index].texture = texture;
+  g_textureInfo[index].level0Surface = level0Surface;
+  g_textureInfo[index].width = width;
+  g_textureInfo[index].height = height;
+  g_textureInfo[index].levels = levels;
+  g_textureInfo[index].format = format;
+  g_textureInfo[index].usage = usage;
+  g_textureInfo[index].pool = pool;
+  g_textureInfo[index].rtxHashAttempted = false;
+  g_textureInfo[index].rtxHashValid = false;
+  g_textureInfo[index].configuredUiTexture = false;
+  g_textureInfo[index].rtxHash = 0;
+}
+
+bool CopyTextureLevel(IDirect3DTexture9* source, IDirect3DTexture9* dest, UINT level) {
+  D3DSURFACE_DESC desc = {};
+  if (FAILED(source->GetLevelDesc(level, &desc))) {
+    return false;
+  }
+
+  UINT rowBytes = 0;
+  UINT rowCount = 0;
+  if (!ComputeTextureCopyLayout(desc.Format, desc.Width, desc.Height, &rowBytes, &rowCount)) {
+    return false;
+  }
+
+  D3DLOCKED_RECT sourceRect = {};
+  if (FAILED(source->LockRect(level, &sourceRect, nullptr, D3DLOCK_READONLY))) {
+    return false;
+  }
+
+  D3DLOCKED_RECT destRect = {};
+  if (FAILED(dest->LockRect(level, &destRect, nullptr, 0))) {
+    source->UnlockRect(level);
+    return false;
+  }
+
+  bool copied = false;
+  if (sourceRect.pBits != nullptr && destRect.pBits != nullptr &&
+      sourceRect.Pitch > 0 && destRect.Pitch > 0) {
+    const UINT bytesPerRow = MinUInt(
+        rowBytes,
+        static_cast<UINT>(MinInt(sourceRect.Pitch, destRect.Pitch)));
+    const BYTE* sourceBytes = static_cast<const BYTE*>(sourceRect.pBits);
+    BYTE* destBytes = static_cast<BYTE*>(destRect.pBits);
+    for (UINT row = 0; row < rowCount; ++row) {
+      memcpy(destBytes + row * destRect.Pitch, sourceBytes + row * sourceRect.Pitch, bytesPerRow);
+    }
+    copied = true;
+  }
+
+  dest->UnlockRect(level);
+  source->UnlockRect(level);
+  return copied;
+}
+
+bool CopyTextureData(IDirect3DTexture9* source, IDirect3DTexture9* dest) {
+  if (source == nullptr || dest == nullptr) {
+    return false;
+  }
+
+  const UINT levels = MinUInt(source->GetLevelCount(), dest->GetLevelCount());
+  if (levels == 0) {
+    return false;
+  }
+
+  for (UINT level = 0; level < levels; ++level) {
+    if (!CopyTextureLevel(source, dest, level)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+IDirect3DBaseTexture9* GetOrCreateDefaultTextureCopy(
+    IDirect3DDevice9* device,
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info) {
+  if (!kBindDefaultCopiesForManagedTextures || device == nullptr || texture == nullptr ||
+      g_origCreateTexture == nullptr || !ShouldCreateDefaultTextureCopy(info)) {
+    return nullptr;
+  }
+
+  TextureCopyInfo* copyInfo = EnsureTextureCopyInfo(texture);
+  if (copyInfo == nullptr) {
+    return nullptr;
+  }
+
+  IDirect3DTexture9* sourceTexture = reinterpret_cast<IDirect3DTexture9*>(texture);
+  D3DSURFACE_DESC desc = {};
+  if (FAILED(sourceTexture->GetLevelDesc(0, &desc))) {
+    InterlockedIncrement(const_cast<LONG*>(&g_textureCopyFailures));
+    return nullptr;
+  }
+  const UINT levels = sourceTexture->GetLevelCount();
+
+  if (copyInfo->attempted && !TextureCopyDescriptorMatches(copyInfo, desc, levels)) {
+    const LONG stale = InterlockedIncrement(const_cast<LONG*>(&g_textureStaleShadows));
+    if (stale <= 80 || (stale % 500) == 0) {
+      Log(
+          "managed texture stale shadow #%ld: src=%p old=%ux%u/%s levels=%u "
+          "new=%ux%u/%s levels=%u replacement=%p",
+          stale,
+          texture,
+          copyInfo->width,
+          copyInfo->height,
+          FormatName(copyInfo->format),
+          copyInfo->levels,
+          desc.Width,
+          desc.Height,
+          FormatName(desc.Format),
+          levels,
+          copyInfo->replacement);
+    }
+    ResetTextureCopyInfo(copyInfo, true, false);
+  }
+
+  if (!copyInfo->attempted) {
+    copyInfo->attempted = true;
+
+    const LONG attempt = InterlockedIncrement(const_cast<LONG*>(&g_textureCopyAttempts));
+    UINT unusedRowBytes = 0;
+    UINT unusedRowCount = 0;
+    if (!ComputeTextureCopyLayout(desc.Format, desc.Width, desc.Height, &unusedRowBytes, &unusedRowCount)) {
+      if (attempt <= 40 || (attempt % 500) == 0) {
+        Log(
+            "managed texture shadow unsupported #%ld: tex=%p %ux%u fmt=%s(%u)",
+            attempt,
+            texture,
+            desc.Width,
+            desc.Height,
+            FormatName(desc.Format),
+            static_cast<unsigned>(desc.Format));
+      }
+      InterlockedIncrement(const_cast<LONG*>(&g_textureCopyFailures));
+      return nullptr;
+    }
+
+    IDirect3DTexture9* systemTexture = nullptr;
+    HRESULT result = g_origCreateTexture(
+        device,
+        desc.Width,
+        desc.Height,
+        levels,
+        0,
+        desc.Format,
+        D3DPOOL_SYSTEMMEM,
+        &systemTexture,
+        nullptr);
+    if (FAILED(result) || systemTexture == nullptr) {
+      if (attempt <= 40 || (attempt % 500) == 0) {
+        Log(
+            "managed texture shadow sysmem create failed #%ld: hr=0x%08lx tex=%p "
+            "%ux%u fmt=%s(%u) levels=%u",
+            attempt,
+            static_cast<unsigned long>(result),
+            texture,
+            desc.Width,
+            desc.Height,
+            FormatName(desc.Format),
+            static_cast<unsigned>(desc.Format),
+            levels);
+      }
+      InterlockedIncrement(const_cast<LONG*>(&g_textureCopyFailures));
+      return nullptr;
+    }
+
+    IDirect3DTexture9* defaultTexture = nullptr;
+    result = g_origCreateTexture(
+        device,
+        desc.Width,
+        desc.Height,
+        levels,
+        0,
+        desc.Format,
+        D3DPOOL_DEFAULT,
+        &defaultTexture,
+        nullptr);
+    if (FAILED(result) || defaultTexture == nullptr) {
+      if (attempt <= 40 || (attempt % 500) == 0) {
+        Log(
+            "managed texture shadow default create failed #%ld: hr=0x%08lx tex=%p "
+            "%ux%u fmt=%s(%u) levels=%u",
+            attempt,
+            static_cast<unsigned long>(result),
+            texture,
+            desc.Width,
+            desc.Height,
+            FormatName(desc.Format),
+            static_cast<unsigned>(desc.Format),
+            levels);
+      }
+      systemTexture->Release();
+      InterlockedIncrement(const_cast<LONG*>(&g_textureCopyFailures));
+      return nullptr;
+    }
+
+    RegisterTexture(defaultTexture, nullptr, desc.Width, desc.Height, levels, desc.Format, 0, D3DPOOL_DEFAULT);
+    copyInfo->staging = systemTexture;
+    copyInfo->replacement = defaultTexture;
+    copyInfo->width = desc.Width;
+    copyInfo->height = desc.Height;
+    copyInfo->levels = levels;
+    copyInfo->format = desc.Format;
+    copyInfo->dirty = true;
+    copyInfo->dirtyLevels = 0xFFFFFFFFul;
+    copyInfo->uploaded = false;
+
+    const LONG success = InterlockedIncrement(const_cast<LONG*>(&g_textureCopySuccesses));
+    if (success <= 80 || (success % 500) == 0) {
+      Log(
+          "managed texture shadow created #%ld: attempt=%ld src=%p staging=%p dst=%p "
+          "%ux%u fmt=%s(%u) levels=%u",
+          success,
+          attempt,
+          texture,
+          systemTexture,
+          defaultTexture,
+          desc.Width,
+          desc.Height,
+          FormatName(desc.Format),
+          static_cast<unsigned>(desc.Format),
+          levels);
+    }
+  }
+
+  if (copyInfo->staging == nullptr || copyInfo->replacement == nullptr) {
+    return nullptr;
+  }
+
+  if (copyInfo->dirty || !copyInfo->uploaded) {
+    HRESULT uploadResult = S_OK;
+    bool copied = CopyTextureData(sourceTexture, copyInfo->staging);
+    if (copied) {
+      uploadResult = device->UpdateTexture(copyInfo->staging, copyInfo->replacement);
+      copied = SUCCEEDED(uploadResult);
+    }
+
+    if (!copied) {
+      const LONG failure = InterlockedIncrement(const_cast<LONG*>(&g_textureShadowUploadFailures));
+      if (failure <= 80 || (failure % 500) == 0) {
+        Log(
+            "managed texture shadow upload failed #%ld: hr=0x%08lx src=%p dst=%p "
+            "%ux%u fmt=%s(%u) levels=%u dirtyLevels=0x%08lx",
+            failure,
+            static_cast<unsigned long>(uploadResult),
+            texture,
+            copyInfo->replacement,
+            desc.Width,
+            desc.Height,
+            FormatName(desc.Format),
+            static_cast<unsigned>(desc.Format),
+            levels,
+            copyInfo->dirtyLevels);
+      }
+      return nullptr;
+    }
+
+    copyInfo->dirty = false;
+    copyInfo->dirtyLevels = 0;
+    copyInfo->uploaded = true;
+
+    const LONG upload = InterlockedIncrement(const_cast<LONG*>(&g_textureShadowUploads));
+    if (upload <= 80 || (upload % 1000) == 0) {
+      Log(
+          "managed texture shadow upload #%ld: src=%p dst=%p %ux%u fmt=%s(%u) levels=%u",
+          upload,
+          texture,
+          copyInfo->replacement,
+          desc.Width,
+          desc.Height,
+          FormatName(desc.Format),
+          static_cast<unsigned>(desc.Format),
+          levels);
+    }
+  }
+
+  return copyInfo->replacement;
+}
+
+template <typename Fn>
+bool HookVtableSlot(void* object, DWORD index, Fn hook, Fn* original, const char* name) {
+  if (object == nullptr || hook == nullptr || original == nullptr) {
+    Log("%s hook skipped: invalid input", name);
+    return false;
+  }
+
+  void*** objectVtable = reinterpret_cast<void***>(object);
+  void** vtable = *objectVtable;
+  if (vtable == nullptr) {
+    Log("%s hook skipped: null vtable", name);
+    return false;
+  }
+
+  void** slot = &vtable[index];
+  const void* hookPtr = reinterpret_cast<const void*>(hook);
+  if (*slot == hookPtr) {
+    return true;
+  }
+
+  DWORD oldProtect = 0;
+  if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    Log("%s hook failed: VirtualProtect error=%lu", name, GetLastError());
+    return false;
+  }
+
+  if (*original == nullptr) {
+    *original = reinterpret_cast<Fn>(*slot);
+  }
+  void* previous = *slot;
+  *slot = const_cast<void*>(hookPtr);
+
+  DWORD ignored = 0;
+  VirtualProtect(slot, sizeof(void*), oldProtect, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), slot, sizeof(void*));
+
+  Log("%s hook installed: slot=%p original=%p hook=%p", name, slot, previous, hookPtr);
+  return true;
+}
+
+ULONG APIENTRY Hook_TextureRelease(IDirect3DTexture9* self) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_textureReleaseCalls));
+  if (g_origTextureRelease == nullptr) {
+    return 0;
+  }
+
+  const TextureInfo* info = FindTextureInfo(self);
+  const UINT width = info != nullptr ? info->width : 0;
+  const UINT height = info != nullptr ? info->height : 0;
+  const UINT levels = info != nullptr ? info->levels : 0;
+  const D3DFORMAT format = info != nullptr ? info->format : D3DFMT_UNKNOWN;
+  const D3DPOOL pool = info != nullptr ? info->pool : D3DPOOL_DEFAULT;
+  TextureCopyInfo* copyInfo = FindTextureCopyInfo(self);
+  const bool hadShadow = copyInfo != nullptr &&
+      (copyInfo->staging != nullptr || copyInfo->replacement != nullptr || copyInfo->attempted);
+
+  const ULONG refs = g_origTextureRelease(self);
+  if (refs == 0) {
+    if (copyInfo != nullptr) {
+      ResetTextureCopyInfo(copyInfo, true, true);
+    }
+    RemoveTextureInfo(self);
+    RemoveRtTextureUsageInfo(self);
+  }
+
+  if (count <= 80 || hadShadow || refs == 0 || (count % 5000) == 0) {
+    Log(
+        "Texture Release #%ld: tex=%p refs=%lu hadShadow=%d info=%ux%u/%s pool=%u levels=%u",
+        count,
+        self,
+        static_cast<unsigned long>(refs),
+        hadShadow ? 1 : 0,
+        width,
+        height,
+        FormatName(format),
+        static_cast<unsigned>(pool),
+        levels);
+  }
+
+  return refs;
+}
+
+HRESULT APIENTRY Hook_TextureLockRect(
+    IDirect3DTexture9* self,
+    UINT level,
+    D3DLOCKED_RECT* lockedRect,
+    const RECT* rect,
+    DWORD flags) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_textureLockCalls));
+  if (g_origTextureLockRect == nullptr) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  const HRESULT result = g_origTextureLockRect(self, level, lockedRect, rect, flags);
+  const bool writeLock = (flags & D3DLOCK_READONLY) == 0;
+  if (SUCCEEDED(result) && writeLock) {
+    const TextureInfo* info = FindTextureInfo(self);
+    if (ShouldCreateDefaultTextureCopy(info)) {
+      TextureCopyInfo* copyInfo = EnsureTextureCopyInfo(self);
+      if (copyInfo != nullptr) {
+        copyInfo->writeLockedLevels |= TextureLevelMask(level);
+      }
+    }
+  }
+
+  if (count <= 40 || (count % 5000) == 0) {
+    const TextureInfo* info = FindTextureInfo(self);
+    Log(
+        "Texture LockRect #%ld: hr=0x%08lx tex=%p level=%u flags=0x%08lx write=%d "
+        "info=%ux%u/%s pool=%u",
+        count,
+        static_cast<unsigned long>(result),
+        self,
+        level,
+        flags,
+        writeLock ? 1 : 0,
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? static_cast<unsigned>(info->pool) : 0);
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_TextureUnlockRect(IDirect3DTexture9* self, UINT level) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_textureUnlockCalls));
+  TextureCopyInfo* copyInfo = FindTextureCopyInfo(self);
+  const DWORD mask = TextureLevelMask(level);
+  const bool wasWriteLocked = copyInfo != nullptr && (copyInfo->writeLockedLevels & mask) != 0;
+
+  if (g_origTextureUnlockRect == nullptr) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  const HRESULT result = g_origTextureUnlockRect(self, level);
+  if (copyInfo != nullptr && SUCCEEDED(result)) {
+    copyInfo->writeLockedLevels &= ~mask;
+  }
+  if (SUCCEEDED(result) && wasWriteLocked) {
+    MarkTextureDirty(self, level, "UnlockRect");
+  }
+
+  if (count <= 40 || (count % 5000) == 0) {
+    const TextureInfo* info = FindTextureInfo(self);
+    Log(
+        "Texture UnlockRect #%ld: hr=0x%08lx tex=%p level=%u writeTracked=%d "
+        "info=%ux%u/%s pool=%u",
+        count,
+        static_cast<unsigned long>(result),
+        self,
+        level,
+        wasWriteLocked ? 1 : 0,
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? static_cast<unsigned>(info->pool) : 0);
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_TextureAddDirtyRect(IDirect3DTexture9* self, const RECT* dirtyRect) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_textureAddDirtyCalls));
+  if (g_origTextureAddDirtyRect == nullptr) {
+    return D3DERR_INVALIDCALL;
+  }
+
+  const HRESULT result = g_origTextureAddDirtyRect(self, dirtyRect);
+  if (SUCCEEDED(result)) {
+    MarkTextureDirty(self, 0, "AddDirtyRect");
+  }
+
+  if (count <= 40 || (count % 5000) == 0) {
+    const TextureInfo* info = FindTextureInfo(self);
+    Log(
+        "Texture AddDirtyRect #%ld: hr=0x%08lx tex=%p rect=%s info=%ux%u/%s pool=%u",
+        count,
+        static_cast<unsigned long>(result),
+        self,
+        dirtyRect != nullptr ? "set" : "null",
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? static_cast<unsigned>(info->pool) : 0);
+  }
+
+  return result;
+}
+
+void HookTexture(IDirect3DTexture9* texture) {
+  if (texture == nullptr) {
+    return;
+  }
+
+  HookVtableSlot(
+      texture,
+      kTextureReleaseIndex,
+      Hook_TextureRelease,
+      &g_origTextureRelease,
+      "IDirect3DTexture9::Release");
+  HookVtableSlot(
+      texture,
+      kTextureLockRectIndex,
+      Hook_TextureLockRect,
+      &g_origTextureLockRect,
+      "IDirect3DTexture9::LockRect");
+  HookVtableSlot(
+      texture,
+      kTextureUnlockRectIndex,
+      Hook_TextureUnlockRect,
+      &g_origTextureUnlockRect,
+      "IDirect3DTexture9::UnlockRect");
+  HookVtableSlot(
+      texture,
+      kTextureAddDirtyRectIndex,
+      Hook_TextureAddDirtyRect,
+      &g_origTextureAddDirtyRect,
+      "IDirect3DTexture9::AddDirtyRect");
+}
+
+void LogMatrixSample(const char* label, LONG count, const D3DMATRIX& matrix) {
+  if (count <= 5 || (count % 1000) == 0) {
+    Log(
+        "%s #%ld: "
+        "[%.4f %.4f %.4f %.4f] "
+        "[%.4f %.4f %.4f %.4f] "
+        "[%.4f %.4f %.4f %.4f] "
+        "[%.4f %.4f %.4f %.4f]",
+        label,
+        count,
+        matrix._11,
+        matrix._12,
+        matrix._13,
+        matrix._14,
+        matrix._21,
+        matrix._22,
+        matrix._23,
+        matrix._24,
+        matrix._31,
+        matrix._32,
+        matrix._33,
+        matrix._34,
+        matrix._41,
+        matrix._42,
+        matrix._43,
+        matrix._44);
+  }
+}
+
+bool VertexElementsHaveUsage(
+    const D3DVERTEXELEMENT9* elements,
+    BYTE usage,
+    const char* label,
+    bool* anyPosition) {
+  if (anyPosition != nullptr) {
+    *anyPosition = false;
+  }
+
+  if (elements == nullptr) {
+    return false;
+  }
+
+  bool found = false;
+  for (int i = 0; i < 128; ++i) {
+    const D3DVERTEXELEMENT9& elem = elements[i];
+    if (elem.Stream == 0xFF && elem.Type == D3DDECLTYPE_UNUSED) {
+      break;
+    }
+
+    if (elem.Usage == D3DDECLUSAGE_POSITION && anyPosition != nullptr) {
+      *anyPosition = true;
+    }
+    if (elem.Usage == usage) {
+      found = true;
+    }
+
+    if (label != nullptr && i < 8) {
+      Log(
+          "%s elem[%d]: stream=%u offset=%u type=%u method=%u usage=%u usageIndex=%u",
+          label,
+          i,
+          elem.Stream,
+          elem.Offset,
+          elem.Type,
+          elem.Method,
+          elem.Usage,
+          elem.UsageIndex);
+    }
+  }
+
+  return found;
+}
+
+void RegisterDeclaration(
+    IDirect3DVertexDeclaration9* declaration,
+    bool hasPosition,
+    bool hasPositionT) {
+  if (declaration == nullptr) {
+    return;
+  }
+
+  LONG existingCount = InterlockedCompareExchange(
+      const_cast<LONG*>(&g_declInfoCount),
+      0,
+      0);
+  const LONG maxCount = static_cast<LONG>(sizeof(g_declInfo) / sizeof(g_declInfo[0]));
+  if (existingCount > maxCount) {
+    existingCount = maxCount;
+  }
+  for (LONG i = 0; i < existingCount; ++i) {
+    if (g_declInfo[i].declaration == declaration) {
+      g_declInfo[i].hasPosition = hasPosition;
+      g_declInfo[i].hasPositionT = hasPositionT;
+      return;
+    }
+  }
+
+  if (existingCount >= maxCount) {
+    return;
+  }
+
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_declInfoCount)) - 1;
+  if (index >= 0 && index < maxCount) {
+    g_declInfo[index].declaration = declaration;
+    g_declInfo[index].hasPosition = hasPosition;
+    g_declInfo[index].hasPositionT = hasPositionT;
+  }
+}
+
+bool DeclarationHasPositionT(IDirect3DVertexDeclaration9* declaration) {
+  if (declaration == nullptr) {
+    return false;
+  }
+
+  LONG count = InterlockedCompareExchange(const_cast<LONG*>(&g_declInfoCount), 0, 0);
+  const LONG maxCount = static_cast<LONG>(sizeof(g_declInfo) / sizeof(g_declInfo[0]));
+  if (count > maxCount) {
+    count = maxCount;
+  }
+  for (LONG i = 0; i < count; ++i) {
+    if (g_declInfo[i].declaration == declaration) {
+      return g_declInfo[i].hasPositionT;
+    }
+  }
+
+  return false;
+}
+
+LayoutState GetLayoutState() {
+  LayoutState state = {};
+  state.fvf = g_currentFvf;
+  state.declaration = g_currentDeclaration;
+  state.vertexShader = g_currentVertexShader;
+  state.fvfRhw = IsPreTransformedFvf(g_currentFvf);
+  state.declarationPositionT = DeclarationHasPositionT(g_currentDeclaration);
+  state.shaderActive = g_currentVertexShader != nullptr;
+  state.unknown = g_currentFvf == 0 && g_currentDeclaration == nullptr;
+  return state;
+}
+
+bool ResendCameraForDraw(IDirect3DDevice9* device, bool skipForLayout) {
+  if (device == nullptr || g_origSetTransform == nullptr || skipForLayout) {
+    return false;
+  }
+
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_currentViewIsIdentity), 0, 0) != 0) {
+    const LONG skipped =
+        InterlockedIncrement(const_cast<LONG*>(&g_skippedCameraResendsIdentityView));
+    if (skipped <= 40 || (skipped % 1000) == 0) {
+      Log("skipped camera resend for identity-view draw #%ld", skipped);
+    }
+    return false;
+  }
+
+  const LONG depth = InterlockedIncrement(const_cast<LONG*>(&g_resendDepth));
+  if (depth != 1) {
+    InterlockedDecrement(const_cast<LONG*>(&g_resendDepth));
+    return false;
+  }
+
+  const bool haveView = InterlockedCompareExchange(const_cast<LONG*>(&g_haveView), 0, 0) != 0;
+  const bool haveProjection =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_haveProjection), 0, 0) != 0;
+
+  if (haveView) {
+    g_origSetTransform(device, D3DTS_VIEW, &g_lastView);
+  }
+  if (haveProjection) {
+    g_origSetTransform(device, D3DTS_PROJECTION, &g_lastProjection);
+  }
+  if (haveView || haveProjection) {
+    InterlockedIncrement(const_cast<LONG*>(&g_resendCalls));
+  }
+
+  InterlockedDecrement(const_cast<LONG*>(&g_resendDepth));
+  return haveView || haveProjection;
+}
+
+void ApplyTextureStageForDraw(
+    IDirect3DDevice9* device,
+    DWORD stage,
+    const LayoutState& layout,
+    const char* drawName,
+    LONG drawCount) {
+  if (device == nullptr || stage >= kTrackedTextureStages || g_origSetTexture == nullptr) {
+    return;
+  }
+
+  IDirect3DBaseTexture9* sourceTexture = g_sourceTextureStages[stage];
+  IDirect3DBaseTexture9* desiredTexture = sourceTexture;
+  const TextureInfo* sourceInfo = FindTextureInfo(sourceTexture);
+  bool copiedTextureBound = false;
+  bool configuredUiCopyBound = false;
+  unsigned long long configuredUiHash = 0;
+
+  if (ShouldShadowTextureForDraw(sourceTexture, sourceInfo, layout)) {
+    IDirect3DBaseTexture9* defaultCopy = GetOrCreateDefaultTextureCopy(device, sourceTexture, sourceInfo);
+    if (defaultCopy != nullptr) {
+      desiredTexture = defaultCopy;
+      copiedTextureBound = true;
+    }
+  }
+
+  if (g_boundTextureStages[stage] != desiredTexture) {
+    const HRESULT result = g_origSetTexture(device, stage, desiredTexture);
+    if (SUCCEEDED(result)) {
+      g_boundTextureStages[stage] = desiredTexture;
+      if (stage == 0) {
+        g_currentTexture0 = desiredTexture;
+      }
+      if (copiedTextureBound) {
+        InterlockedIncrement(const_cast<LONG*>(&g_textureCopyBinds));
+        bool configuredUi = false;
+        if (sourceInfo != nullptr && !IsCompressedTextureFormat(sourceInfo->format) &&
+            TryGetCachedRtxTextureHash(sourceTexture, sourceInfo, &configuredUiHash, &configuredUi) &&
+            configuredUi) {
+          configuredUiCopyBound = true;
+          InterlockedIncrement(const_cast<LONG*>(&g_configuredUiTextureBinds));
+        }
+        if (!(layout.fvfRhw || layout.declarationPositionT) && IsOverlayRenderStateActive() &&
+            sourceInfo != nullptr && !IsCompressedTextureFormat(sourceInfo->format)) {
+          InterlockedIncrement(const_cast<LONG*>(&g_overlayStateTextureBinds));
+        }
+      }
+      const LONG binds = InterlockedIncrement(const_cast<LONG*>(&g_drawTimeTextureBinds));
+      if (binds <= 80 || (binds % 1000) == 0) {
+        const TextureInfo* boundInfo = FindTextureInfo(desiredTexture);
+        Log(
+            "draw-time texture bind #%ld: draw=%s #%ld stage=%lu source=%p bound=%p "
+            "copyBound=%d configuredUi=%d hash=0x%016llX preT=%d "
+            "sourceInfo=%ux%u/%s pool=%u boundInfo=%ux%u/%s pool=%u",
+            binds,
+            drawName != nullptr ? drawName : "draw",
+            drawCount,
+            stage,
+            sourceTexture,
+            desiredTexture,
+            copiedTextureBound ? 1 : 0,
+            configuredUiCopyBound ? 1 : 0,
+            configuredUiHash,
+            (layout.fvfRhw || layout.declarationPositionT) ? 1 : 0,
+            sourceInfo != nullptr ? sourceInfo->width : 0,
+            sourceInfo != nullptr ? sourceInfo->height : 0,
+            sourceInfo != nullptr ? FormatName(sourceInfo->format) : "unknown",
+            sourceInfo != nullptr ? static_cast<unsigned>(sourceInfo->pool) : 0,
+            boundInfo != nullptr ? boundInfo->width : 0,
+            boundInfo != nullptr ? boundInfo->height : 0,
+            boundInfo != nullptr ? FormatName(boundInfo->format) : "unknown",
+            boundInfo != nullptr ? static_cast<unsigned>(boundInfo->pool) : 0);
+      }
+    } else if (drawCount <= 80 || (drawCount % 1000) == 0) {
+      Log(
+          "draw-time texture bind failed: hr=0x%08lx draw=%s #%ld stage=%lu source=%p bound=%p",
+          static_cast<unsigned long>(result),
+          drawName != nullptr ? drawName : "draw",
+          drawCount,
+          stage,
+          sourceTexture,
+          desiredTexture);
+    }
+  } else if (stage == 0) {
+    g_currentTexture0 = desiredTexture;
+  }
+}
+
+void ApplyTextureStateForDraw(
+    IDirect3DDevice9* device,
+    const LayoutState& layout,
+    const char* drawName,
+    LONG drawCount) {
+  ApplyTextureStageForDraw(device, 0, layout, drawName, drawCount);
+}
+
+void LogDrawSample(
+    const char* drawName,
+    LONG count,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount,
+    UINT vertexCount,
+    const LayoutState& layout,
+    bool resent) {
+  const bool preTransformed = layout.fvfRhw || layout.declarationPositionT;
+  const bool interesting =
+      count <= 20 || (count % 5000) == 0 || (preTransformed && count <= 1000);
+  if (!interesting) {
+    return;
+  }
+
+  const SurfaceInfo* rtInfo = FindSurfaceInfo(g_currentRenderTarget0);
+  const TextureInfo* texInfo = FindTextureInfo(g_currentTexture0);
+
+  Log(
+      "%s #%ld: primType=%u primCount=%u vertices=%u fvf=0x%08lx fvfRHW=%d decl=%p "
+      "declPOSITIONT=%d vs=%p shader=%d unknown=%d resent=%d rt0=%p "
+      "rt0Info=%ux%u/%s rtFromTex=%d tex0=%p tex0RT=%d tex0Info=%ux%u/%s "
+      "tex0Usage=0x%08lx tex0Pool=%u tex0Levels=%u z=%lu zwrite=%lu "
+      "alphaBlend=%lu alphaTest=%lu lighting=%lu fog=%lu overlayState=%d",
+      drawName,
+      count,
+      static_cast<unsigned>(primitiveType),
+      primitiveCount,
+      vertexCount,
+      layout.fvf,
+      layout.fvfRhw ? 1 : 0,
+      layout.declaration,
+      layout.declarationPositionT ? 1 : 0,
+      layout.vertexShader,
+      layout.shaderActive ? 1 : 0,
+      layout.unknown ? 1 : 0,
+      resent ? 1 : 0,
+      g_currentRenderTarget0,
+      rtInfo != nullptr ? rtInfo->width : 0,
+      rtInfo != nullptr ? rtInfo->height : 0,
+      rtInfo != nullptr ? FormatName(rtInfo->format) : "unknown",
+      rtInfo != nullptr && rtInfo->fromTexture ? 1 : 0,
+      g_currentTexture0,
+      texInfo != nullptr && IsRenderTargetUsage(texInfo->usage) ? 1 : 0,
+      texInfo != nullptr ? texInfo->width : 0,
+      texInfo != nullptr ? texInfo->height : 0,
+      texInfo != nullptr ? FormatName(texInfo->format) : "unknown",
+      texInfo != nullptr ? texInfo->usage : 0,
+      texInfo != nullptr ? static_cast<unsigned>(texInfo->pool) : 0,
+      texInfo != nullptr ? texInfo->levels : 0,
+      g_rsZEnable,
+      g_rsZWriteEnable,
+      g_rsAlphaBlendEnable,
+      g_rsAlphaTestEnable,
+      g_rsLighting,
+      g_rsFogEnable,
+      IsBehaviorOverlayDraw(layout) ? 1 : 0);
+}
+
+void LogSummary(const char* reason) {
+  Log(
+      "summary[%s]: presents=%ld indexed=%ld fixedIndexed=%ld preTIndexed=%ld "
+      "shaderIndexed=%ld unknownIndexed=%ld primitive=%ld preTPrimitive=%ld "
+      "indexedUP=%ld primitiveUP=%ld preTUP=%ld resends=%ld viewSets=%ld "
+      "identityViewResendSkips=%ld projSets=%ld ignoredIdentityViews=%ld "
+      "fvfSets=%ld declCreates=%ld declSets=%ld vsSets=%ld",
+      reason,
+      InterlockedCompareExchange(const_cast<LONG*>(&g_presentCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_indexedDrawCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_fixedFunctionIndexedDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_preTransformedIndexedDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_shaderIndexedDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_unknownIndexedDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_primitiveDrawCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_preTransformedPrimitiveDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_indexedUpDrawCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_primitiveUpDrawCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_preTransformedUpDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_resendCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setViewCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_skippedCameraResendsIdentityView), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setProjectionCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_ignoredIdentityViews), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setFvfCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_createDeclarationCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setDeclarationCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setVertexShaderCalls), 0, 0));
+
+  const SurfaceInfo* rtInfo = FindSurfaceInfo(g_currentRenderTarget0);
+  const TextureInfo* texInfo = FindTextureInfo(g_currentTexture0);
+  Log(
+      "summary[%s] targets: rt0=%p rt0Info=%ux%u/%s fromTex=%d depth=%p tex0=%p "
+      "tex0RT=%d tex0Info=%ux%u/%s surfaces=%ld textures=%ld createTex=%ld "
+      "createRT=%ld setRT=%ld redirectedRT=%ld setDS=%ld setRS=%ld setTex=%ld stretch=%ld "
+      "preloadTex=%ld copyAttempts=%ld copySuccess=%ld copyFailures=%ld copyBinds=%ld "
+      "drawTimeBinds=%ld overlayStateBinds=%ld configuredUiBinds=%ld "
+      "configuredUiHashHits=%ld configuredUiHashes=%ld candidates=%ld candidateRows=%ld candidateDumps=%ld "
+      "dirtyMarks=%ld shadowUploads=%ld shadowUploadFailures=%ld staleShadows=%ld "
+      "texReleases=%ld texLocks=%ld texUnlocks=%ld dirtyRects=%ld skippedRTComposite=%ld "
+      "allowedUiRTComposite=%ld uiRtMarks=%ld uiRtNativeSets=%ld uiRtInfos=%ld "
+      "hudCandidateRows=%ld",
+      reason,
+      g_currentRenderTarget0,
+      rtInfo != nullptr ? rtInfo->width : 0,
+      rtInfo != nullptr ? rtInfo->height : 0,
+      rtInfo != nullptr ? FormatName(rtInfo->format) : "unknown",
+      rtInfo != nullptr && rtInfo->fromTexture ? 1 : 0,
+      g_currentDepthStencil,
+      g_currentTexture0,
+      texInfo != nullptr && IsRenderTargetUsage(texInfo->usage) ? 1 : 0,
+      texInfo != nullptr ? texInfo->width : 0,
+      texInfo != nullptr ? texInfo->height : 0,
+      texInfo != nullptr ? FormatName(texInfo->format) : "unknown",
+      InterlockedCompareExchange(const_cast<LONG*>(&g_surfaceInfoCount), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureInfoCount), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_createTextureCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_createRenderTargetCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setRenderTargetCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_redirectedRenderTargetCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setDepthStencilCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setRenderStateCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setTextureCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_stretchRectCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_preloadTextureCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCopyAttempts), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCopySuccesses), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCopyFailures), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCopyBinds), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_drawTimeTextureBinds), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_overlayStateTextureBinds), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_configuredUiTextureBinds), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_configuredUiTextureHashHits), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_configuredUiTextureHashCount), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCandidateInfoCount), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCandidateRows), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureCandidateDumps), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureDirtyMarks), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureShadowUploads), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureShadowUploadFailures), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureStaleShadows), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureReleaseCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureLockCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureUnlockCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_textureAddDirtyCalls), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_skippedRtCompositeDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_allowedUiRtCompositeDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_markedUiRtDraws), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_nativeUiRenderTargetSets), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_rtTextureUsageInfoCount), 0, 0),
+      InterlockedCompareExchange(const_cast<LONG*>(&g_hudCandidateRows), 0, 0));
+}
+
+HRESULT APIENTRY Hook_CreateTexture(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    UINT levels,
+    DWORD usage,
+    D3DFORMAT format,
+    D3DPOOL pool,
+    IDirect3DTexture9** texture,
+    HANDLE* sharedHandle) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_createTextureCalls));
+  const HRESULT result = g_origCreateTexture(
+      self,
+      width,
+      height,
+      levels,
+      usage,
+      format,
+      pool,
+      texture,
+      sharedHandle);
+
+  IDirect3DSurface9* level0Surface = nullptr;
+  if (SUCCEEDED(result) && texture != nullptr && *texture != nullptr) {
+    HookTexture(*texture);
+    const UINT actualLevels = (*texture)->GetLevelCount();
+    RegisterTexture(*texture, nullptr, width, height, actualLevels, format, usage, pool);
+
+    if (IsRenderTargetUsage(usage) && SUCCEEDED((*texture)->GetSurfaceLevel(0, &level0Surface))) {
+      RegisterSurface(level0Surface, *texture, width, height, format, usage, pool, true);
+      RegisterTexture(*texture, level0Surface, width, height, actualLevels, format, usage, pool);
+      level0Surface->Release();
+    }
+  }
+
+  if (count <= 50 || IsRenderTargetUsage(usage)) {
+    Log(
+        "CreateTexture #%ld: hr=0x%08lx tex=%p level0=%p %ux%u levels=%u "
+        "fmt=%s(%u) usage=0x%08lx rt=%d pool=%u",
+        count,
+        static_cast<unsigned long>(result),
+        texture != nullptr ? *texture : nullptr,
+        level0Surface,
+        width,
+        height,
+        levels,
+        FormatName(format),
+        static_cast<unsigned>(format),
+        usage,
+        IsRenderTargetUsage(usage) ? 1 : 0,
+        static_cast<unsigned>(pool));
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_CreateRenderTarget(
+    IDirect3DDevice9* self,
+    UINT width,
+    UINT height,
+    D3DFORMAT format,
+    D3DMULTISAMPLE_TYPE multiSample,
+    DWORD multisampleQuality,
+    BOOL lockable,
+    IDirect3DSurface9** surface,
+    HANDLE* sharedHandle) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_createRenderTargetCalls));
+  const HRESULT result = g_origCreateRenderTarget(
+      self,
+      width,
+      height,
+      format,
+      multiSample,
+      multisampleQuality,
+      lockable,
+      surface,
+      sharedHandle);
+
+  if (SUCCEEDED(result) && surface != nullptr && *surface != nullptr) {
+    RegisterSurface(
+        *surface,
+        nullptr,
+        width,
+        height,
+        format,
+        D3DUSAGE_RENDERTARGET,
+        D3DPOOL_DEFAULT,
+        false);
+  }
+
+  Log(
+      "CreateRenderTarget #%ld: hr=0x%08lx surface=%p %ux%u fmt=%s(%u) "
+      "ms=%u msq=%lu lockable=%d",
+      count,
+      static_cast<unsigned long>(result),
+      surface != nullptr ? *surface : nullptr,
+      width,
+      height,
+      FormatName(format),
+      static_cast<unsigned>(format),
+      static_cast<unsigned>(multiSample),
+      multisampleQuality,
+      lockable ? 1 : 0);
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_SetRenderTarget(
+    IDirect3DDevice9* self,
+    DWORD renderTargetIndex,
+    IDirect3DSurface9* surface) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setRenderTargetCalls));
+  SurfaceInfo* requestedInfo = EnsureSurfaceInfo(surface, false);
+  IDirect3DSurface9* actualSurface = surface;
+  bool redirected = false;
+  const bool behaviorUiRt = IsBehaviorMarkedUiRenderTargetSurface(requestedInfo);
+
+  const bool redirectCandidate =
+      kRedirectAllColorRtTexturesToPrimary
+          ? IsColorRenderTargetTextureSurface(requestedInfo)
+          : IsFullSizeSceneRenderTarget(requestedInfo);
+  const bool shouldRedirect = redirectCandidate && !behaviorUiRt;
+  if (renderTargetIndex == 0 && kRedirectFullSizeSceneRtToPrimary && shouldRedirect &&
+      g_primaryRenderTarget != nullptr) {
+    actualSurface = g_primaryRenderTarget;
+    redirected = true;
+  }
+
+  HRESULT result = g_origSetRenderTarget(self, renderTargetIndex, actualSurface);
+  if (FAILED(result) && redirected) {
+    actualSurface = surface;
+    redirected = false;
+    result = g_origSetRenderTarget(self, renderTargetIndex, actualSurface);
+  }
+
+  SurfaceInfo* actualInfo = nullptr;
+  if (SUCCEEDED(result)) {
+    actualInfo = EnsureSurfaceInfo(actualSurface, false);
+    if (renderTargetIndex == 0) {
+      g_requestedRenderTarget0 = surface;
+      g_currentRenderTarget0 = actualSurface;
+      g_currentRenderTarget0Redirected = redirected;
+      if (IsPrimarySurfaceInfo(actualInfo)) {
+        g_primaryRenderTarget = actualSurface;
+      }
+      if (redirected) {
+        InterlockedIncrement(const_cast<LONG*>(&g_redirectedRenderTargetCalls));
+      } else if (behaviorUiRt && actualSurface == surface) {
+        RtTextureUsageInfo* usage =
+            requestedInfo != nullptr ? EnsureRtTextureUsageInfo(requestedInfo->ownerTexture) : nullptr;
+        if (usage != nullptr) {
+          InterlockedIncrement(&usage->nativeTargetSets);
+        }
+        const LONG nativeSets =
+            InterlockedIncrement(const_cast<LONG*>(&g_nativeUiRenderTargetSets));
+        if (nativeSets <= 40 || (nativeSets % 500) == 0) {
+          Log(
+              "native behavior UI RT SetRenderTarget #%ld nativeSets=%ld: surface=%p "
+              "targetTex=%p info=%ux%u/%s",
+              count,
+              nativeSets,
+              surface,
+              requestedInfo != nullptr ? requestedInfo->ownerTexture : nullptr,
+              requestedInfo != nullptr ? requestedInfo->width : 0,
+              requestedInfo != nullptr ? requestedInfo->height : 0,
+              requestedInfo != nullptr ? FormatName(requestedInfo->format) : "unknown");
+        }
+      }
+    }
+  }
+
+  if (count <= 80 || (redirected && (count % 500) == 0) ||
+      (behaviorUiRt && (count % 500) == 0) ||
+      (renderTargetIndex == 0 && (count % 500) == 0)) {
+    Log(
+        "SetRenderTarget #%ld: hr=0x%08lx index=%lu requested=%p reqInfo=%ux%u/%s "
+        "reqUsage=0x%08lx reqFromTex=%d actual=%p actualInfo=%ux%u/%s "
+        "actualUsage=0x%08lx actualFromTex=%d redirected=%d behaviorUiRt=%d",
+        count,
+        static_cast<unsigned long>(result),
+        renderTargetIndex,
+        surface,
+        requestedInfo != nullptr ? requestedInfo->width : 0,
+        requestedInfo != nullptr ? requestedInfo->height : 0,
+        requestedInfo != nullptr ? FormatName(requestedInfo->format) : "unknown",
+        requestedInfo != nullptr ? requestedInfo->usage : 0,
+        requestedInfo != nullptr && requestedInfo->fromTexture ? 1 : 0,
+        actualSurface,
+        actualInfo != nullptr ? actualInfo->width : 0,
+        actualInfo != nullptr ? actualInfo->height : 0,
+        actualInfo != nullptr ? FormatName(actualInfo->format) : "unknown",
+        actualInfo != nullptr ? actualInfo->usage : 0,
+        actualInfo != nullptr && actualInfo->fromTexture ? 1 : 0,
+        redirected ? 1 : 0,
+        behaviorUiRt ? 1 : 0);
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_SetDepthStencilSurface(IDirect3DDevice9* self, IDirect3DSurface9* surface) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setDepthStencilCalls));
+  const HRESULT result = g_origSetDepthStencilSurface(self, surface);
+
+  SurfaceInfo* info = nullptr;
+  if (SUCCEEDED(result)) {
+    g_currentDepthStencil = surface;
+    info = EnsureSurfaceInfo(surface, false);
+  }
+
+  if (count <= 40 || (count % 500) == 0) {
+    Log(
+        "SetDepthStencilSurface #%ld: hr=0x%08lx surface=%p info=%ux%u/%s usage=0x%08lx",
+        count,
+        static_cast<unsigned long>(result),
+        surface,
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? info->usage : 0);
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_SetRenderState(
+    IDirect3DDevice9* self,
+    D3DRENDERSTATETYPE state,
+    DWORD value) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setRenderStateCalls));
+  const HRESULT result = g_origSetRenderState(self, state, value);
+  if (SUCCEEDED(result)) {
+    switch (state) {
+      case D3DRS_ZENABLE:
+        g_rsZEnable = value;
+        break;
+      case D3DRS_ZWRITEENABLE:
+        g_rsZWriteEnable = value;
+        break;
+      case D3DRS_ALPHABLENDENABLE:
+        g_rsAlphaBlendEnable = value;
+        break;
+      case D3DRS_ALPHATESTENABLE:
+        g_rsAlphaTestEnable = value;
+        break;
+      case D3DRS_LIGHTING:
+        g_rsLighting = value;
+        break;
+      case D3DRS_FOGENABLE:
+        g_rsFogEnable = value;
+        break;
+      default:
+        break;
+    }
+  }
+
+  const bool tracked =
+      state == D3DRS_ZENABLE || state == D3DRS_ZWRITEENABLE ||
+      state == D3DRS_ALPHABLENDENABLE || state == D3DRS_ALPHATESTENABLE ||
+      state == D3DRS_LIGHTING || state == D3DRS_FOGENABLE;
+  if (tracked && (count <= 120 || (count % 2000) == 0)) {
+    Log(
+        "SetRenderState #%ld: hr=0x%08lx state=%lu value=%lu z=%lu zwrite=%lu "
+        "alphaBlend=%lu alphaTest=%lu lighting=%lu fog=%lu overlayState=%d",
+        count,
+        static_cast<unsigned long>(result),
+        static_cast<unsigned long>(state),
+        value,
+        g_rsZEnable,
+        g_rsZWriteEnable,
+        g_rsAlphaBlendEnable,
+        g_rsAlphaTestEnable,
+        g_rsLighting,
+        g_rsFogEnable,
+        IsOverlayRenderStateActive() ? 1 : 0);
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_SetTexture(
+    IDirect3DDevice9* self,
+    DWORD stage,
+    IDirect3DBaseTexture9* texture) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setTextureCalls));
+  const TextureInfo* info = FindTextureInfo(texture);
+  const bool isManagedRegularTexture = IsManagedRegularTexture(info);
+  const LayoutState layout = GetLayoutState();
+  const bool preTransformedLayout = layout.fvfRhw || layout.declarationPositionT;
+  if (stage < kTrackedTextureStages) {
+    g_sourceTextureStages[stage] = texture;
+  }
+
+  LONG preloadCount = 0;
+
+  if (kPreloadManagedTexturesBeforeBind && texture != nullptr && isManagedRegularTexture) {
+    texture->PreLoad();
+    preloadCount = InterlockedIncrement(const_cast<LONG*>(&g_preloadTextureCalls));
+    if (preloadCount <= 80 || (preloadCount % 1000) == 0) {
+      Log(
+          "PreLoad texture #%ld: setTex=%ld stage=%lu tex=%p bound=%p info=%ux%u/%s "
+          "usage=0x%08lx pool=%u levels=%u level0=%p",
+          preloadCount,
+          count,
+          stage,
+          texture,
+          texture,
+          info != nullptr ? info->width : 0,
+          info != nullptr ? info->height : 0,
+          info != nullptr ? FormatName(info->format) : "unknown",
+          info != nullptr ? info->usage : 0,
+          info != nullptr ? static_cast<unsigned>(info->pool) : 0,
+          info != nullptr ? info->levels : 0,
+          info != nullptr ? info->level0Surface : nullptr);
+    }
+  }
+
+  const HRESULT result = g_origSetTexture(self, stage, texture);
+
+  if (SUCCEEDED(result)) {
+    if (stage < kTrackedTextureStages) {
+      g_boundTextureStages[stage] = texture;
+    }
+    if (stage == 0) {
+      g_currentTexture0 = texture;
+    }
+  }
+
+  const TextureInfo* boundInfo = FindTextureInfo(texture);
+  const bool isRenderTargetTexture = boundInfo != nullptr && IsRenderTargetUsage(boundInfo->usage);
+  if (count <= 80 || isRenderTargetTexture || (stage == 0 && (count % 1000) == 0)) {
+    Log(
+        "SetTexture #%ld: hr=0x%08lx stage=%lu tex=%p bound=%p copyBound=%d layoutPreT=%d rtTex=%d "
+        "info=%ux%u/%s usage=0x%08lx pool=%u levels=%u preloaded=%d level0=%p",
+        count,
+        static_cast<unsigned long>(result),
+        stage,
+        texture,
+        texture,
+        0,
+        preTransformedLayout ? 1 : 0,
+        isRenderTargetTexture ? 1 : 0,
+        boundInfo != nullptr ? boundInfo->width : 0,
+        boundInfo != nullptr ? boundInfo->height : 0,
+        boundInfo != nullptr ? FormatName(boundInfo->format) : "unknown",
+        boundInfo != nullptr ? boundInfo->usage : 0,
+        boundInfo != nullptr ? static_cast<unsigned>(boundInfo->pool) : 0,
+        boundInfo != nullptr ? boundInfo->levels : 0,
+        preloadCount != 0 ? 1 : 0,
+        boundInfo != nullptr ? boundInfo->level0Surface : nullptr);
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_StretchRect(
+    IDirect3DDevice9* self,
+    IDirect3DSurface9* sourceSurface,
+    const RECT* sourceRect,
+    IDirect3DSurface9* destSurface,
+    const RECT* destRect,
+    D3DTEXTUREFILTERTYPE filter) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_stretchRectCalls));
+  SurfaceInfo* sourceInfo = EnsureSurfaceInfo(sourceSurface, false);
+  SurfaceInfo* destInfo = EnsureSurfaceInfo(destSurface, false);
+  const HRESULT result = g_origStretchRect(
+      self,
+      sourceSurface,
+      sourceRect,
+      destSurface,
+      destRect,
+      filter);
+
+  if (count <= 100 || (count % 500) == 0) {
+    Log(
+        "StretchRect #%ld: hr=0x%08lx src=%p %ux%u/%s dst=%p %ux%u/%s filter=%u",
+        count,
+        static_cast<unsigned long>(result),
+        sourceSurface,
+        sourceInfo != nullptr ? sourceInfo->width : 0,
+        sourceInfo != nullptr ? sourceInfo->height : 0,
+        sourceInfo != nullptr ? FormatName(sourceInfo->format) : "unknown",
+        destSurface,
+        destInfo != nullptr ? destInfo->width : 0,
+        destInfo != nullptr ? destInfo->height : 0,
+        destInfo != nullptr ? FormatName(destInfo->format) : "unknown",
+        static_cast<unsigned>(filter));
+  }
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_Present(
+    IDirect3DDevice9* self,
+    const RECT* sourceRect,
+    const RECT* destRect,
+    HWND destWindowOverride,
+    const RGNDATA* dirtyRegion) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_presentCalls));
+  if (count <= 5 || (count % 60) == 0) {
+    LogSummary("present");
+  }
+
+  // Reset the per-frame draw counter so candidate rows can record where in the
+  // frame a draw landed. HUD/pause overlays cluster at the end of the frame.
+  InterlockedExchange(const_cast<LONG*>(&g_frameDrawIndex), 0);
+  InterlockedExchange(const_cast<LONG*>(&g_worldDrawnThisFrame), 0);
+
+  return g_origPresent(self, sourceRect, destRect, destWindowOverride, dirtyRegion);
+}
+
+HRESULT APIENTRY Hook_SetTransform(
+    IDirect3DDevice9* self,
+    D3DTRANSFORMSTATETYPE state,
+    const D3DMATRIX* matrix) {
+  if (matrix != nullptr) {
+    if (state == D3DTS_VIEW) {
+      const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setViewCalls));
+      if (IsIdentityView(*matrix)) {
+        InterlockedExchange(const_cast<LONG*>(&g_currentViewIsIdentity), 1);
+        const LONG ignored = InterlockedIncrement(const_cast<LONG*>(&g_ignoredIdentityViews));
+        if (ignored <= 5 || (ignored % 1000) == 0) {
+          Log("ignored identity D3DTS_VIEW #%ld at SetTransform call #%ld", ignored, count);
+        }
+      } else {
+        InterlockedExchange(const_cast<LONG*>(&g_currentViewIsIdentity), 0);
+        g_lastView = *matrix;
+        InterlockedExchange(const_cast<LONG*>(&g_haveView), 1);
+        LogMatrixSample("cached non-identity D3DTS_VIEW", count, g_lastView);
+      }
+    } else if (state == D3DTS_PROJECTION) {
+      g_lastProjection = *matrix;
+      InterlockedExchange(const_cast<LONG*>(&g_haveProjection), 1);
+      const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setProjectionCalls));
+      LogMatrixSample("cached D3DTS_PROJECTION", count, g_lastProjection);
+    }
+  }
+
+  return g_origSetTransform(self, state, matrix);
+}
+
+HRESULT APIENTRY Hook_SetFVF(IDirect3DDevice9* self, DWORD fvf) {
+  g_currentFvf = fvf;
+  g_currentDeclaration = nullptr;
+
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setFvfCalls));
+  if (count <= 20 || (count % 5000) == 0) {
+    Log(
+        "SetFVF #%ld: fvf=0x%08lx rhw=%d",
+        count,
+        fvf,
+        IsPreTransformedFvf(fvf) ? 1 : 0);
+  }
+
+  return g_origSetFVF(self, fvf);
+}
+
+HRESULT APIENTRY Hook_CreateVertexDeclaration(
+    IDirect3DDevice9* self,
+    const D3DVERTEXELEMENT9* vertexElements,
+    IDirect3DVertexDeclaration9** declaration) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_createDeclarationCalls));
+  const bool logElements = count <= 10;
+  bool hasPosition = false;
+  bool hasPositionT = false;
+
+  if (logElements) {
+    hasPositionT = VertexElementsHaveUsage(
+        vertexElements,
+        D3DDECLUSAGE_POSITIONT,
+        "CreateVertexDeclaration",
+        &hasPosition);
+  } else {
+    hasPositionT = VertexElementsHaveUsage(
+        vertexElements,
+        D3DDECLUSAGE_POSITIONT,
+        nullptr,
+        &hasPosition);
+  }
+
+  const HRESULT result = g_origCreateVertexDeclaration(self, vertexElements, declaration);
+
+  if (SUCCEEDED(result) && declaration != nullptr && *declaration != nullptr) {
+    RegisterDeclaration(*declaration, hasPosition, hasPositionT);
+  }
+
+  Log(
+      "CreateVertexDeclaration #%ld: hr=0x%08lx decl=%p hasPOSITION=%d hasPOSITIONT=%d",
+      count,
+      static_cast<unsigned long>(result),
+      declaration != nullptr ? *declaration : nullptr,
+      hasPosition ? 1 : 0,
+      hasPositionT ? 1 : 0);
+
+  return result;
+}
+
+HRESULT APIENTRY Hook_SetVertexDeclaration(
+    IDirect3DDevice9* self,
+    IDirect3DVertexDeclaration9* declaration) {
+  g_currentDeclaration = declaration;
+  g_currentFvf = 0;
+
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setDeclarationCalls));
+  const bool hasPositionT = DeclarationHasPositionT(declaration);
+  if (count <= 20 || (count % 1000) == 0 || hasPositionT) {
+    Log(
+        "SetVertexDeclaration #%ld: decl=%p hasPOSITIONT=%d",
+        count,
+        declaration,
+        hasPositionT ? 1 : 0);
+  }
+
+  return g_origSetVertexDeclaration(self, declaration);
+}
+
+HRESULT APIENTRY Hook_SetVertexShader(
+    IDirect3DDevice9* self,
+    IDirect3DVertexShader9* shader) {
+  g_currentVertexShader = shader;
+
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_setVertexShaderCalls));
+  if (count <= 20 || (count % 1000) == 0 || shader != nullptr) {
+    Log("SetVertexShader #%ld: shader=%p", count, shader);
+  }
+
+  return g_origSetVertexShader(self, shader);
+}
+
+HRESULT APIENTRY Hook_DrawPrimitive(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT startVertex,
+    UINT primitiveCount) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_primitiveDrawCalls));
+  InterlockedIncrement(const_cast<LONG*>(&g_frameDrawIndex));
+  const LayoutState layout = GetLayoutState();
+  const bool preTransformed = layout.fvfRhw || layout.declarationPositionT;
+  if (preTransformed) {
+    InterlockedIncrement(const_cast<LONG*>(&g_preTransformedPrimitiveDraws));
+  }
+
+  const SurfaceInfo* rtInfo = FindSurfaceInfo(g_currentRenderTarget0);
+  IDirect3DBaseTexture9* compositeTexture =
+      g_sourceTextureStages[0] != nullptr ? g_sourceTextureStages[0] : g_currentTexture0;
+  const bool allowUiRtComposite = IsNativeUiRenderTargetCompositeTexture(compositeTexture);
+  const bool skipRtComposite =
+      kSkipRtTextureCompositesToPrimary && preTransformed && IsRenderTargetTexture(compositeTexture) &&
+      !allowUiRtComposite && (kSkipAllRtTextureComposites || IsPrimarySurfaceInfo(rtInfo));
+  if (skipRtComposite) {
+    const LONG skipped = InterlockedIncrement(const_cast<LONG*>(&g_skippedRtCompositeDraws));
+    if (skipped <= 20 || (skipped % 1000) == 0) {
+      const TextureInfo* texInfo = FindTextureInfo(compositeTexture);
+      Log(
+          "skipped RT composite DrawPrimitive #%ld skipped=%ld: primType=%u primCount=%u "
+          "rt0=%p rt0Info=%ux%u/%s tex0=%p tex0Info=%ux%u/%s",
+          count,
+          skipped,
+          static_cast<unsigned>(primitiveType),
+          primitiveCount,
+          g_currentRenderTarget0,
+          rtInfo != nullptr ? rtInfo->width : 0,
+          rtInfo != nullptr ? rtInfo->height : 0,
+          rtInfo != nullptr ? FormatName(rtInfo->format) : "unknown",
+          compositeTexture,
+          texInfo != nullptr ? texInfo->width : 0,
+          texInfo != nullptr ? texInfo->height : 0,
+          texInfo != nullptr ? FormatName(texInfo->format) : "unknown");
+    }
+    return D3D_OK;
+  }
+
+  if (preTransformed && allowUiRtComposite) {
+    RtTextureUsageInfo* usage = FindRtTextureUsageInfo(compositeTexture);
+    if (usage != nullptr) {
+      InterlockedIncrement(&usage->allowedComposites);
+    }
+    const LONG allowed = InterlockedIncrement(const_cast<LONG*>(&g_allowedUiRtCompositeDraws));
+    if (allowed <= 40 || (allowed % 500) == 0) {
+      const TextureInfo* texInfo = FindTextureInfo(compositeTexture);
+      Log(
+          "allowed behavior UI RT composite DrawPrimitive #%ld allowed=%ld: primType=%u "
+          "primCount=%u rt0=%p rt0Info=%ux%u/%s tex0=%p tex0Info=%ux%u/%s",
+          count,
+          allowed,
+          static_cast<unsigned>(primitiveType),
+          primitiveCount,
+          g_currentRenderTarget0,
+          rtInfo != nullptr ? rtInfo->width : 0,
+          rtInfo != nullptr ? rtInfo->height : 0,
+          rtInfo != nullptr ? FormatName(rtInfo->format) : "unknown",
+          compositeTexture,
+          texInfo != nullptr ? texInfo->width : 0,
+          texInfo != nullptr ? texInfo->height : 0,
+          texInfo != nullptr ? FormatName(texInfo->format) : "unknown");
+    }
+  }
+
+  ApplyTextureStateForDraw(self, layout, "DrawPrimitive", count);
+  LogTextureCandidateForDraw("DrawPrimitive", count, primitiveType, primitiveCount, 0, layout);
+  MarkRequestedRenderTargetUiDraw(layout, "DrawPrimitive", count, primitiveType, primitiveCount);
+  LogDrawSample("DrawPrimitive", count, primitiveType, primitiveCount, 0, layout, false);
+
+  return g_origDrawPrimitive(self, primitiveType, startVertex, primitiveCount);
+}
+
+HRESULT APIENTRY Hook_DrawIndexedPrimitive(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    INT baseVertexIndex,
+    UINT minVertexIndex,
+    UINT numVertices,
+    UINT startIndex,
+    UINT primitiveCount) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_indexedDrawCalls));
+  InterlockedIncrement(const_cast<LONG*>(&g_frameDrawIndex));
+  const LayoutState layout = GetLayoutState();
+  const bool preTransformed = layout.fvfRhw || layout.declarationPositionT;
+
+  if (preTransformed) {
+    InterlockedIncrement(const_cast<LONG*>(&g_preTransformedIndexedDraws));
+  } else if (layout.shaderActive) {
+    InterlockedIncrement(const_cast<LONG*>(&g_shaderIndexedDraws));
+  } else if (layout.unknown) {
+    InterlockedIncrement(const_cast<LONG*>(&g_unknownIndexedDraws));
+  } else {
+    InterlockedIncrement(const_cast<LONG*>(&g_fixedFunctionIndexedDraws));
+    // Real 3D world geometry (fixed-function indexed, not an overlay sprite).
+    // Marks the frame so later screen-space draws can be told apart from menu UI.
+    if (!IsFixedFunctionOverlayDraw(layout)) {
+      InterlockedExchange(const_cast<LONG*>(&g_worldDrawnThisFrame), 1);
+    }
+  }
+
+  const bool resent = ResendCameraForDraw(self, preTransformed || layout.shaderActive);
+  ApplyTextureStateForDraw(self, layout, "DrawIndexedPrimitive", count);
+  LogTextureCandidateForDraw("DrawIndexedPrimitive", count, primitiveType, primitiveCount, numVertices, layout);
+  MarkRequestedRenderTargetUiDraw(
+      layout, "DrawIndexedPrimitive", count, primitiveType, primitiveCount);
+  LogDrawSample("DrawIndexedPrimitive", count, primitiveType, primitiveCount, numVertices, layout, resent);
+
+  return g_origDrawIndexedPrimitive(
+      self,
+      primitiveType,
+      baseVertexIndex,
+      minVertexIndex,
+      numVertices,
+      startIndex,
+      primitiveCount);
+}
+
+HRESULT APIENTRY Hook_DrawPrimitiveUP(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT primitiveCount,
+    const void* vertexStreamZeroData,
+    UINT vertexStreamZeroStride) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_primitiveUpDrawCalls));
+  InterlockedIncrement(const_cast<LONG*>(&g_frameDrawIndex));
+  const LayoutState layout = GetLayoutState();
+  if (layout.fvfRhw || layout.declarationPositionT) {
+    InterlockedIncrement(const_cast<LONG*>(&g_preTransformedUpDraws));
+  }
+  ApplyTextureStateForDraw(self, layout, "DrawPrimitiveUP", count);
+  LogTextureCandidateForDraw("DrawPrimitiveUP", count, primitiveType, primitiveCount, 0, layout);
+  MarkRequestedRenderTargetUiDraw(layout, "DrawPrimitiveUP", count, primitiveType, primitiveCount);
+  LogDrawSample("DrawPrimitiveUP", count, primitiveType, primitiveCount, 0, layout, false);
+
+  return g_origDrawPrimitiveUP(
+      self,
+      primitiveType,
+      primitiveCount,
+      vertexStreamZeroData,
+      vertexStreamZeroStride);
+}
+
+HRESULT APIENTRY Hook_DrawIndexedPrimitiveUP(
+    IDirect3DDevice9* self,
+    D3DPRIMITIVETYPE primitiveType,
+    UINT minVertexIndex,
+    UINT numVertices,
+    UINT primitiveCount,
+    const void* indexData,
+    D3DFORMAT indexDataFormat,
+    const void* vertexStreamZeroData,
+    UINT vertexStreamZeroStride) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_indexedUpDrawCalls));
+  InterlockedIncrement(const_cast<LONG*>(&g_frameDrawIndex));
+  const LayoutState layout = GetLayoutState();
+  const bool preTransformed = layout.fvfRhw || layout.declarationPositionT;
+  if (preTransformed) {
+    InterlockedIncrement(const_cast<LONG*>(&g_preTransformedUpDraws));
+  }
+
+  const bool resent = ResendCameraForDraw(self, preTransformed || layout.shaderActive);
+  ApplyTextureStateForDraw(self, layout, "DrawIndexedPrimitiveUP", count);
+  LogTextureCandidateForDraw("DrawIndexedPrimitiveUP", count, primitiveType, primitiveCount, numVertices, layout);
+  MarkRequestedRenderTargetUiDraw(
+      layout, "DrawIndexedPrimitiveUP", count, primitiveType, primitiveCount);
+  LogDrawSample("DrawIndexedPrimitiveUP", count, primitiveType, primitiveCount, numVertices, layout, resent);
+
+  return g_origDrawIndexedPrimitiveUP(
+      self,
+      primitiveType,
+      minVertexIndex,
+      numVertices,
+      primitiveCount,
+      indexData,
+      indexDataFormat,
+      vertexStreamZeroData,
+      vertexStreamZeroStride);
+}
+
+void HookDevice(IDirect3DDevice9* device) {
+  if (device == nullptr) {
+    return;
+  }
+
+  if (InterlockedExchange(const_cast<LONG*>(&g_deviceHooked), 1) == 0) {
+    Log("installing IDirect3DDevice9 hooks on device=%p", device);
+  }
+
+  HookVtableSlot(device, kDevicePresentIndex, Hook_Present, &g_origPresent, "IDirect3DDevice9::Present");
+  HookVtableSlot(
+      device,
+      kDeviceCreateTextureIndex,
+      Hook_CreateTexture,
+      &g_origCreateTexture,
+      "IDirect3DDevice9::CreateTexture");
+  HookVtableSlot(
+      device,
+      kDeviceCreateRenderTargetIndex,
+      Hook_CreateRenderTarget,
+      &g_origCreateRenderTarget,
+      "IDirect3DDevice9::CreateRenderTarget");
+  HookVtableSlot(
+      device,
+      kDeviceStretchRectIndex,
+      Hook_StretchRect,
+      &g_origStretchRect,
+      "IDirect3DDevice9::StretchRect");
+  HookVtableSlot(
+      device,
+      kDeviceSetRenderTargetIndex,
+      Hook_SetRenderTarget,
+      &g_origSetRenderTarget,
+      "IDirect3DDevice9::SetRenderTarget");
+  HookVtableSlot(
+      device,
+      kDeviceSetDepthStencilSurfaceIndex,
+      Hook_SetDepthStencilSurface,
+      &g_origSetDepthStencilSurface,
+      "IDirect3DDevice9::SetDepthStencilSurface");
+  HookVtableSlot(
+      device,
+      kDeviceSetTransformIndex,
+      Hook_SetTransform,
+      &g_origSetTransform,
+      "IDirect3DDevice9::SetTransform");
+  HookVtableSlot(
+      device,
+      kDeviceSetRenderStateIndex,
+      Hook_SetRenderState,
+      &g_origSetRenderState,
+      "IDirect3DDevice9::SetRenderState");
+  HookVtableSlot(device, kDeviceSetTextureIndex, Hook_SetTexture, &g_origSetTexture, "IDirect3DDevice9::SetTexture");
+  HookVtableSlot(
+      device,
+      kDeviceDrawPrimitiveIndex,
+      Hook_DrawPrimitive,
+      &g_origDrawPrimitive,
+      "IDirect3DDevice9::DrawPrimitive");
+  HookVtableSlot(
+      device,
+      kDeviceDrawIndexedPrimitiveIndex,
+      Hook_DrawIndexedPrimitive,
+      &g_origDrawIndexedPrimitive,
+      "IDirect3DDevice9::DrawIndexedPrimitive");
+  HookVtableSlot(
+      device,
+      kDeviceDrawPrimitiveUPIndex,
+      Hook_DrawPrimitiveUP,
+      &g_origDrawPrimitiveUP,
+      "IDirect3DDevice9::DrawPrimitiveUP");
+  HookVtableSlot(
+      device,
+      kDeviceDrawIndexedPrimitiveUPIndex,
+      Hook_DrawIndexedPrimitiveUP,
+      &g_origDrawIndexedPrimitiveUP,
+      "IDirect3DDevice9::DrawIndexedPrimitiveUP");
+  HookVtableSlot(
+      device,
+      kDeviceCreateVertexDeclarationIndex,
+      Hook_CreateVertexDeclaration,
+      &g_origCreateVertexDeclaration,
+      "IDirect3DDevice9::CreateVertexDeclaration");
+  HookVtableSlot(
+      device,
+      kDeviceSetVertexDeclarationIndex,
+      Hook_SetVertexDeclaration,
+      &g_origSetVertexDeclaration,
+      "IDirect3DDevice9::SetVertexDeclaration");
+  HookVtableSlot(device, kDeviceSetFVFIndex, Hook_SetFVF, &g_origSetFVF, "IDirect3DDevice9::SetFVF");
+  HookVtableSlot(
+      device,
+      kDeviceSetVertexShaderIndex,
+      Hook_SetVertexShader,
+      &g_origSetVertexShader,
+      "IDirect3DDevice9::SetVertexShader");
+
+  DWORD stateValue = 0;
+  if (SUCCEEDED(device->GetRenderState(D3DRS_ZENABLE, &stateValue))) {
+    g_rsZEnable = stateValue;
+  }
+  if (SUCCEEDED(device->GetRenderState(D3DRS_ZWRITEENABLE, &stateValue))) {
+    g_rsZWriteEnable = stateValue;
+  }
+  if (SUCCEEDED(device->GetRenderState(D3DRS_ALPHABLENDENABLE, &stateValue))) {
+    g_rsAlphaBlendEnable = stateValue;
+  }
+  if (SUCCEEDED(device->GetRenderState(D3DRS_ALPHATESTENABLE, &stateValue))) {
+    g_rsAlphaTestEnable = stateValue;
+  }
+  if (SUCCEEDED(device->GetRenderState(D3DRS_LIGHTING, &stateValue))) {
+    g_rsLighting = stateValue;
+  }
+  if (SUCCEEDED(device->GetRenderState(D3DRS_FOGENABLE, &stateValue))) {
+    g_rsFogEnable = stateValue;
+  }
+  Log(
+      "initial render states: z=%lu zwrite=%lu alphaBlend=%lu alphaTest=%lu "
+      "lighting=%lu fog=%lu overlayState=%d",
+      g_rsZEnable,
+      g_rsZWriteEnable,
+      g_rsAlphaBlendEnable,
+      g_rsAlphaTestEnable,
+      g_rsLighting,
+      g_rsFogEnable,
+      IsOverlayRenderStateActive() ? 1 : 0);
+
+  IDirect3DSurface9* currentRt = nullptr;
+  if (SUCCEEDED(device->GetRenderTarget(0, &currentRt)) && currentRt != nullptr) {
+    g_currentRenderTarget0 = currentRt;
+    g_requestedRenderTarget0 = currentRt;
+    g_primaryRenderTarget = currentRt;
+    g_currentRenderTarget0Redirected = false;
+    InterlockedExchange(const_cast<LONG*>(&g_currentViewIsIdentity), 0);
+    SurfaceInfo* info = EnsureSurfaceInfo(currentRt, false);
+    Log(
+        "initial GetRenderTarget(0): surface=%p info=%ux%u/%s usage=0x%08lx",
+        currentRt,
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? info->usage : 0);
+    currentRt->Release();
+  }
+
+  IDirect3DSurface9* currentDepth = nullptr;
+  if (SUCCEEDED(device->GetDepthStencilSurface(&currentDepth)) && currentDepth != nullptr) {
+    g_currentDepthStencil = currentDepth;
+    SurfaceInfo* info = EnsureSurfaceInfo(currentDepth, false);
+    Log(
+        "initial GetDepthStencilSurface: surface=%p info=%ux%u/%s usage=0x%08lx",
+        currentDepth,
+        info != nullptr ? info->width : 0,
+        info != nullptr ? info->height : 0,
+        info != nullptr ? FormatName(info->format) : "unknown",
+        info != nullptr ? info->usage : 0);
+    currentDepth->Release();
+  }
+}
+
+HRESULT APIENTRY Hook_CreateDevice(
+    IDirect3D9* self,
+    UINT adapter,
+    D3DDEVTYPE deviceType,
+    HWND focusWindow,
+    DWORD behaviorFlags,
+    D3DPRESENT_PARAMETERS* presentationParameters,
+    IDirect3DDevice9** returnedDevice) {
+  const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_createDeviceCalls));
+  Log(
+      "IDirect3D9::CreateDevice #%ld: adapter=%u type=%u flags=0x%08lx",
+      count,
+      adapter,
+      static_cast<unsigned>(deviceType),
+      behaviorFlags);
+
+  const HRESULT result = g_origCreateDevice(
+      self,
+      adapter,
+      deviceType,
+      focusWindow,
+      behaviorFlags,
+      presentationParameters,
+      returnedDevice);
+
+  Log(
+      "IDirect3D9::CreateDevice #%ld returned hr=0x%08lx device=%p",
+      count,
+      static_cast<unsigned long>(result),
+      returnedDevice != nullptr ? *returnedDevice : nullptr);
+
+  if (SUCCEEDED(result) && returnedDevice != nullptr && *returnedDevice != nullptr) {
+    HookDevice(*returnedDevice);
+  }
+
+  return result;
+}
+
+bool HookD3D9Factory(IDirect3D9* d3d9) {
+  return HookVtableSlot(
+      d3d9,
+      kD3D9CreateDeviceIndex,
+      Hook_CreateDevice,
+      &g_origCreateDevice,
+      "IDirect3D9::CreateDevice");
+}
+
+DWORD WINAPI WorkerThread(void*) {
+  Log("TODCameraResend ASI loaded; gameRoot=%s log=%s", g_gameRoot, g_logPath);
+  LoadConfiguredUiTextureHashes();
+
+  bool loggedCreateFailure = false;
+  for (int attempt = 0; attempt < 3000; ++attempt) {
+    HMODULE d3d9Module = GetModuleHandleA("d3d9.dll");
+    if (d3d9Module != nullptr) {
+      Direct3DCreate9Fn createD3D9 = reinterpret_cast<Direct3DCreate9Fn>(
+          GetProcAddress(d3d9Module, "Direct3DCreate9"));
+
+      if (createD3D9 != nullptr) {
+        IDirect3D9* d3d9 = createD3D9(D3D_SDK_VERSION);
+        if (d3d9 != nullptr) {
+          Log("Direct3DCreate9 probe succeeded: d3d9=%p module=%p", d3d9, d3d9Module);
+          HookD3D9Factory(d3d9);
+          d3d9->Release();
+          Log("factory hook ready");
+          return 0;
+        }
+
+        if (!loggedCreateFailure) {
+          Log("Direct3DCreate9 probe returned null; will retry");
+          loggedCreateFailure = true;
+        }
+      }
+    }
+
+    Sleep(10);
+  }
+
+  Log("timed out waiting for a hookable Direct3D9 factory");
+  return 0;
+}
+
+}  // namespace
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
+  if (reason == DLL_PROCESS_ATTACH) {
+    InitializePaths(module);
+    DisableThreadLibraryCalls(module);
+    HANDLE thread = CreateThread(nullptr, 0, WorkerThread, nullptr, 0, nullptr);
+    if (thread != nullptr) {
+      CloseHandle(thread);
+    }
+  }
+
+  return TRUE;
+}
