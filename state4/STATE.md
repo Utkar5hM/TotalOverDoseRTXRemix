@@ -1,29 +1,22 @@
-# Total Overdose RTX Remix State 4
+# State 4 - 2026-06-02 23:48 IST
 
-Verified by user on 2026-06-02:
-- RTX is visible.
-- HUD is visible.
-- Angle-dependent displaced-geometry glitch is fixed/improved by the identity-view guard.
-- Shooting sparks and blood are visible after the alpha-effect A8 support build.
+Current working Total Overdose RTX Remix support state.
 
-Remaining issue:
-- Some objects/textures appear invisible but still block movement and can be destroyed; destruction animation is visible after shooting.
+Observed working:
+- RTX active.
+- HUD visible.
+- Sparks/blood visible.
+- Previously missing breakable/corrugated panel texture visible.
+- Opaque managed A8 world-copy category removed after sky/world material corruption; sky may be black and is deferred for a proper Remix sky classification pass.
 
-Live ASI at snapshot time:
-- scripts\TODCameraResend.asi
-- Size: 120832 bytes
-- Build: identity-view guard + texture-copy reuse reset + alpha-effect A8 support
+Known remaining work:
+- Proper sky/backdrop classification.
+- Render-distance / capture framing / missing far-screen geometry investigation in TOD.exe.
+- Analyze TOD material and texture submission paths instead of adding broad texture-copy rules.
 
-Minimal snapshot contents:
-- root configs
-- required scripts runtime files
-- current ASI source/build files
-- markdown docs only
-
-Excluded intentionally:
-- screenshots/images
-- extracted video frames
-- rtx-remix logs/captures
-- dxvk cache, metrics, generated object files, old failed ASI attempts
-
-See re_docs\rtx_remix_runtime_debug_log.md for details.
+Important active files:
+- scripts/TODCameraResend.asi
+- scripts/rtx.conf (active Remix config path observed in logs)
+- root/rtx.conf (fallback/mirrored root config may differ if Remix UI saved scripts/rtx.conf)
+- tools/tod_camera_resend_asi/TODCameraResend.cpp
+- re_docs/*.md

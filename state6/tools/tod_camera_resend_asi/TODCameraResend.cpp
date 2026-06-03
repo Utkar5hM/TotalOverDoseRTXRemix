@@ -5,6 +5,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#define XXH_INLINE_ALL
+#include "../../third_party/dxvk-remix/src/util/xxHash/xxhash.h"
+
 #define TOD_ENABLE_RUNTIME_LOG 0
 
 namespace {
@@ -38,6 +41,85 @@ constexpr bool kCopyCompressedManagedTextures = true;
 constexpr bool kCopyWhitelistedUncompressedManagedTextures = true;
 constexpr bool kBindPreTransformedA8CopiesAfterWorld = true;
 constexpr bool kBindManagedA8DrawCopies = true;
+constexpr bool kPatchTodCameraFarClip = true;
+constexpr bool kMarkTodSkyDrawsWithViewportMinZ = true;
+constexpr bool kEnableTodSkyTextureDiscovery = true;
+constexpr bool kHookTodSkyBoxRenderTextureScope = true;
+// Diagnostic: log TOD's fixed-function fog render-state to tod-fog-state.tsv so
+// Remix fog config can be set from evidence (does TOD set FOGENABLE/FOGCOLOR,
+// with what color, on sky vs world draws) instead of guessed.
+constexpr bool kEnableTodFogStateLog = true;
+constexpr bool kEnableTodSkyAssetLoadProbe = false;
+constexpr bool kEnableTodTextureMapProbe = false;
+// Inject a D3D9 directional light each frame so Remix ray-traces a real sun. TOD has
+// no sun light (lighting is baked into vertex colors; the on-screen sun is only a 2D
+// billboard). Remix's SetLight picks up any ENABLED light (DirtyLights) regardless of
+// D3DRS_LIGHTING, and TOD ignores it because its fixed-function lighting is off.
+// Step 1: fixed test direction to confirm Remix lights the scene; later wired to the
+// RE'd TOD sun-direction vector for an automatic per-mission dynamic sun.
+constexpr bool kInjectSunLight = true;
+constexpr DWORD kSunLightIndex = 0;
+constexpr float kTodCameraFarClipOverride = 8000.0f;  // render distance (was 3000); sane cap is 10000
+constexpr float kTodSkyViewportMinZ = 0.999f;
+constexpr uintptr_t kTodImageBaseVa = 0x00400000u;
+constexpr uintptr_t kTodLoadNativeResourceVa = 0x00878AB0u;
+constexpr uintptr_t kTodLoadNativeResourceRva = kTodLoadNativeResourceVa - kTodImageBaseVa;
+constexpr uintptr_t kTodTextureDrawAllTexturesVa = 0x00463850u;
+constexpr uintptr_t kTodTextureDrawAllTexturesRva = kTodTextureDrawAllTexturesVa - kTodImageBaseVa;
+constexpr uintptr_t kTodTextureAssetAllocatorGlobalVa = 0x00A3BE18u;
+constexpr uintptr_t kTodTextureAssetAllocatorGlobalRva =
+    kTodTextureAssetAllocatorGlobalVa - kTodImageBaseVa;
+constexpr uintptr_t kTodTextureAssetLoadFlagGlobalVa = 0x00A3BE2Du;
+constexpr uintptr_t kTodTextureAssetLoadFlagGlobalRva =
+    kTodTextureAssetLoadFlagGlobalVa - kTodImageBaseVa;
+constexpr uintptr_t kTodCameraSystemGlobalVa = 0x00A3DCBCu;
+constexpr uintptr_t kTodCameraSystemGlobalRva = kTodCameraSystemGlobalVa - kTodImageBaseVa;
+constexpr uintptr_t kTodSkyMeshArrayGlobalVa = 0x00A3E0B0u;
+constexpr uintptr_t kTodSkyMeshArrayGlobalRva = kTodSkyMeshArrayGlobalVa - kTodImageBaseVa;
+constexpr uintptr_t kTodSkyBoxRenderVa = 0x008F1E10u;
+constexpr uintptr_t kTodSkyBoxRenderRva = kTodSkyBoxRenderVa - kTodImageBaseVa;
+constexpr uintptr_t kTodRenderListSetMaterialVa = 0x00431660u;
+constexpr uintptr_t kTodRenderListSetMaterialRva =
+    kTodRenderListSetMaterialVa - kTodImageBaseVa;
+constexpr uintptr_t kTodRenderListAddMeshVa = 0x00432C70u;
+constexpr uintptr_t kTodRenderListAddMeshRva =
+    kTodRenderListAddMeshVa - kTodImageBaseVa;
+constexpr uintptr_t kTodRenderMeshDrawVa = 0x004540E0u;
+constexpr uintptr_t kTodRenderMeshDrawRva =
+    kTodRenderMeshDrawVa - kTodImageBaseVa;
+constexpr uintptr_t kTodCameraSlotPrimaryOffset = 0x60u;
+constexpr uintptr_t kTodCameraSlotSecondaryOffset = 0x64u;
+constexpr uintptr_t kTodCameraSlotCurrentOffset = 0x6Cu;
+constexpr uintptr_t kTodCameraNearClipOffset = 0xB8u;
+constexpr uintptr_t kTodCameraFarClipOffset = 0xBCu;
+constexpr uintptr_t kTodRenderMeshVertexBufferOffset = 0x0Cu;
+constexpr uintptr_t kTodRenderMeshIndexBufferOffset = 0x10u;
+constexpr uintptr_t kTodVertexBufferD3DOffset = 0x24u;
+constexpr uintptr_t kTodIndexBufferD3DOffset = 0x1Cu;
+constexpr int kTodSkyMeshCount = 5;
+constexpr LONG kMaxTodSkyRenderMeshes = 64;
+constexpr LONG kMaxTodSkyTextureRecords = 128;
+constexpr LONG kTodTextureMapProbeFrames = 5;
+constexpr LONG kMaxTodForcedTextureRecords = 8192;
+constexpr LONG kMaxTodForcedTexturePending = 2048;
+constexpr LONG kTodTextureAssetAllocatorId = 6;
+constexpr SIZE_T kInlineHookPatchBytes = 6;
+constexpr SIZE_T kTodRenderListSetMaterialPatchBytes = 7;
+constexpr SIZE_T kTodRenderListAddMeshPatchBytes = 7;
+constexpr SIZE_T kTodRenderMeshDrawPatchBytes = 9;
+
+constexpr DWORD kDdsdCaps = 0x00000001u;
+constexpr DWORD kDdsdHeight = 0x00000002u;
+constexpr DWORD kDdsdWidth = 0x00000004u;
+constexpr DWORD kDdsdPitch = 0x00000008u;
+constexpr DWORD kDdsdPixelFormat = 0x00001000u;
+constexpr DWORD kDdsdLinearSize = 0x00080000u;
+constexpr DWORD kDdpfAlphaPixels = 0x00000001u;
+constexpr DWORD kDdpfAlpha = 0x00000002u;
+constexpr DWORD kDdpfFourCc = 0x00000004u;
+constexpr DWORD kDdpfRgb = 0x00000040u;
+constexpr DWORD kDdpfLuminance = 0x00020000u;
+constexpr DWORD kDdsCapsTexture = 0x00001000u;
 
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
 using CreateDeviceFn = HRESULT(APIENTRY*)(
@@ -140,6 +222,13 @@ using SetFVFFn = HRESULT(APIENTRY*)(IDirect3DDevice9* self, DWORD fvf);
 using SetVertexShaderFn = HRESULT(APIENTRY*)(
     IDirect3DDevice9* self,
     IDirect3DVertexShader9* shader);
+using TodSkyBoxRenderFn = void (__fastcall*)(void* self, void* edx);
+using TodRenderListSetMaterialFn =
+    void (__fastcall*)(void* self, void* edx, void* material, DWORD stage);
+using TodRenderListAddMeshFn = void (__fastcall*)(void* self, void* edx, void* mesh);
+using TodRenderMeshDrawFn = void (__fastcall*)(void* self, void* edx, void* mesh);
+using TodLoadNativeResourceFn = void* (__cdecl*)(char* resourcePath);
+using TodTextureDrawAllTexturesFn = void (__cdecl*)();
 
 struct DeclInfo {
   IDirect3DVertexDeclaration9* declaration;
@@ -185,8 +274,69 @@ struct TextureCopyInfo {
   bool attempted;
 };
 
+struct DdsPixelFormat {
+  DWORD size;
+  DWORD flags;
+  DWORD fourCc;
+  DWORD rgbBitCount;
+  DWORD rBitMask;
+  DWORD gBitMask;
+  DWORD bBitMask;
+  DWORD aBitMask;
+};
+
+struct DdsHeader {
+  DWORD size;
+  DWORD flags;
+  DWORD height;
+  DWORD width;
+  DWORD pitchOrLinearSize;
+  DWORD depth;
+  DWORD mipMapCount;
+  DWORD reserved1[11];
+  DdsPixelFormat pixelFormat;
+  DWORD caps;
+  DWORD caps2;
+  DWORD caps3;
+  DWORD caps4;
+  DWORD reserved2;
+};
+
+struct TodSkyTextureRecord {
+  IDirect3DBaseTexture9* texture;
+  unsigned long long hash;
+  bool valid;
+  bool drawnLogged;
+};
+
+struct TodSkyTexturePending {
+  IDirect3DBaseTexture9* sourceTexture;
+  IDirect3DBaseTexture9* boundTexture;
+  LONG skyDraws;
+  UINT primitiveCount;
+  UINT numVertices;
+};
+
+struct TodForcedTextureRecord {
+  IDirect3DBaseTexture9* texture;
+  unsigned long long hash;
+  bool valid;
+};
+
+struct TodForcedTexturePending {
+  IDirect3DBaseTexture9* sourceTexture;
+  IDirect3DBaseTexture9* boundTexture;
+  LONG probeFrame;
+};
+
 char g_gameRoot[MAX_PATH * 2] = {};
 char g_logPath[MAX_PATH * 2] = {};
+char g_todFogStateLogPath[MAX_PATH * 2] = {};
+char g_todSkyTextureLogPath[MAX_PATH * 2] = {};
+char g_todSkyTextureDumpDir[MAX_PATH * 2] = {};
+char g_todSkyAssetLoadProbeLogPath[MAX_PATH * 2] = {};
+char g_todForcedTextureProbeLogPath[MAX_PATH * 2] = {};
+char g_todForcedTextureProbeDumpDir[MAX_PATH * 2] = {};
 
 CreateDeviceFn g_origCreateDevice = nullptr;
 PresentFn g_origPresent = nullptr;
@@ -215,11 +365,25 @@ IDirect3DVertexShader9* g_currentVertexShader = nullptr;
 IDirect3DSurface9* g_currentRenderTarget0 = nullptr;
 IDirect3DSurface9* g_currentDepthStencil = nullptr;
 IDirect3DBaseTexture9* g_currentTexture0 = nullptr;
+IDirect3DBaseTexture9* g_currentSourceTexture0 = nullptr;
 IDirect3DSurface9* g_primaryRenderTarget = nullptr;
 DeclInfo g_declInfo[512] = {};
 SurfaceInfo g_surfaceInfo[2048] = {};
 TextureInfo g_textureInfo[16384] = {};
 TextureCopyInfo g_textureCopyInfo[8192] = {};
+TodSkyTextureRecord g_todSkyTextureRecords[kMaxTodSkyTextureRecords] = {};
+TodSkyTexturePending g_todSkyTexturePending[32] = {};
+TodForcedTextureRecord g_todForcedTextureRecords[kMaxTodForcedTextureRecords] = {};
+TodForcedTexturePending g_todForcedTexturePending[kMaxTodForcedTexturePending] = {};
+TodSkyBoxRenderFn g_origTodSkyBoxRender = nullptr;
+TodRenderListSetMaterialFn g_origTodRenderListSetMaterial = nullptr;
+TodRenderListAddMeshFn g_origTodRenderListAddMesh = nullptr;
+TodRenderMeshDrawFn g_origTodRenderMeshDraw = nullptr;
+BYTE g_todSkyBoxRenderOriginalBytes[kInlineHookPatchBytes] = {};
+BYTE g_todRenderListSetMaterialOriginalBytes[kTodRenderListSetMaterialPatchBytes] = {};
+BYTE g_todRenderListAddMeshOriginalBytes[kTodRenderListAddMeshPatchBytes] = {};
+BYTE g_todRenderMeshDrawOriginalBytes[kTodRenderMeshDrawPatchBytes] = {};
+uintptr_t g_todSkyRenderMeshes[kMaxTodSkyRenderMeshes] = {};
 
 volatile LONG g_declInfoCount = 0;
 volatile LONG g_surfaceInfoCount = 0;
@@ -255,6 +419,7 @@ volatile LONG g_setDeclarationCalls = 0;
 volatile LONG g_createDeclarationCalls = 0;
 volatile LONG g_setVertexShaderCalls = 0;
 volatile LONG g_presentCalls = 0;
+volatile LONG g_sunLightInjections = 0;
 volatile LONG g_indexedDrawCalls = 0;
 volatile LONG g_primitiveDrawCalls = 0;
 volatile LONG g_indexedUpDrawCalls = 0;
@@ -273,6 +438,34 @@ volatile LONG g_zEnable = 1;
 volatile LONG g_zWriteEnable = 1;
 volatile LONG g_alphaBlendEnable = 0;
 volatile LONG g_alphaTestEnable = 0;
+volatile LONG g_cameraFarClipPatches = 0;
+volatile LONG g_todSkyDraws = 0;
+volatile LONG g_todSkyViewportMarks = 0;
+volatile LONG g_todSkyTextureRows = 0;
+volatile LONG g_todSkyTextureRecordCount = 0;
+volatile LONG g_todSkyTexturePendingCount = 0;
+volatile LONG g_todSkyBoxRenderHooked = 0;
+volatile LONG g_todRenderListSetMaterialHooked = 0;
+volatile LONG g_todRenderListAddMeshHooked = 0;
+volatile LONG g_todRenderMeshDrawHooked = 0;
+volatile LONG g_todSkyBoxRenderDepth = 0;
+volatile LONG g_todSkyMeshDrawDepth = 0;
+volatile LONG g_todSkyBoxRenderCalls = 0;
+volatile LONG g_todSkyBoxRenderFirstCallLogged = 0;
+volatile LONG g_todSkyMaterialCommands = 0;
+volatile LONG g_todSkyMeshCommands = 0;
+volatile LONG g_todSkyMeshRecords = 0;
+volatile LONG g_todSkyMeshDrawExecutions = 0;
+volatile LONG g_todSkyMeshDrawFirstLogged = 0;
+volatile LONG g_todSkyViewportFirstLogged = 0;
+volatile LONG g_todSkyScopedTextureQueues = 0;
+volatile LONG g_todForcedTextureRows = 0;
+volatile LONG g_todForcedTextureRecordCount = 0;
+volatile LONG g_todForcedTexturePendingCount = 0;
+volatile LONG g_todTextureMapProbeFramesDone = 0;
+volatile LONG g_todTextureMapProbeActive = 0;
+volatile LONG g_todSkyAssetLoadProbeDone = 0;
+volatile LONG g_todSkyAssetLoadProbeRows = 0;
 
 void StripFileName(char* path) {
   char* slash = strrchr(path, '\\');
@@ -300,6 +493,36 @@ void InitializePaths(HMODULE module) {
       sizeof(g_logPath),
       "%s\\rtx-remix\\logs\\tod-camera-resend.log",
       g_gameRoot);
+  snprintf(
+      g_todFogStateLogPath,
+      sizeof(g_todFogStateLogPath),
+      "%s\\rtx-remix\\logs\\tod-fog-state.tsv",
+      g_gameRoot);
+  snprintf(
+      g_todSkyTextureLogPath,
+      sizeof(g_todSkyTextureLogPath),
+      "%s\\rtx-remix\\logs\\tod-sky-textures.tsv",
+      g_gameRoot);
+  snprintf(
+      g_todSkyTextureDumpDir,
+      sizeof(g_todSkyTextureDumpDir),
+      "%s\\rtx-remix\\logs\\tod-sky-textures",
+      g_gameRoot);
+  snprintf(
+      g_todSkyAssetLoadProbeLogPath,
+      sizeof(g_todSkyAssetLoadProbeLogPath),
+      "%s\\rtx-remix\\logs\\tod-sky-asset-load-probe.tsv",
+      g_gameRoot);
+  snprintf(
+      g_todForcedTextureProbeLogPath,
+      sizeof(g_todForcedTextureProbeLogPath),
+      "%s\\rtx-remix\\logs\\tod-forced-texture-probe.tsv",
+      g_gameRoot);
+  snprintf(
+      g_todForcedTextureProbeDumpDir,
+      sizeof(g_todForcedTextureProbeDumpDir),
+      "%s\\rtx-remix\\logs\\tod-forced-texture-probe",
+      g_gameRoot);
 }
 
 void LockLog() {
@@ -319,6 +542,12 @@ void EnsureLogDirectory() {
   snprintf(logsDir, sizeof(logsDir), "%s\\rtx-remix\\logs", g_gameRoot);
   CreateDirectoryA(remixDir, nullptr);
   CreateDirectoryA(logsDir, nullptr);
+  if (g_todSkyTextureDumpDir[0] != '\0') {
+    CreateDirectoryA(g_todSkyTextureDumpDir, nullptr);
+  }
+  if (g_todForcedTextureProbeDumpDir[0] != '\0') {
+    CreateDirectoryA(g_todForcedTextureProbeDumpDir, nullptr);
+  }
 }
 
 void Log(const char* fmt, ...) {
@@ -373,6 +602,303 @@ void Log(const char* fmt, ...) {
 #pragma warning(disable : 4100 4189)
 #define Log(...) ((void)0)
 #endif
+
+bool IsCommittedMemoryRange(uintptr_t address, size_t bytes, bool requireWritable) {
+  if (address == 0 || bytes == 0 || address + bytes < address) {
+    return false;
+  }
+
+  MEMORY_BASIC_INFORMATION mbi = {};
+  if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi)) != sizeof(mbi)) {
+    return false;
+  }
+
+  if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+    return false;
+  }
+
+  const uintptr_t regionBase = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+  const uintptr_t regionEnd = regionBase + mbi.RegionSize;
+  if (address < regionBase || address + bytes > regionEnd || regionEnd < regionBase) {
+    return false;
+  }
+
+  const DWORD protect = mbi.Protect & 0xFFu;
+  if (!requireWritable) {
+    return protect == PAGE_READONLY || protect == PAGE_READWRITE ||
+        protect == PAGE_WRITECOPY || protect == PAGE_EXECUTE_READ ||
+        protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+  }
+
+  return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+      protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool TryReadPointer(uintptr_t address, uintptr_t* value) {
+  if (value == nullptr || !IsCommittedMemoryRange(address, sizeof(uintptr_t), false)) {
+    return false;
+  }
+
+  *value = *reinterpret_cast<const uintptr_t*>(address);
+  return *value != 0;
+}
+
+bool TryReadFloat(uintptr_t address, float* value) {
+  if (value == nullptr || !IsCommittedMemoryRange(address, sizeof(float), false)) {
+    return false;
+  }
+
+  *value = *reinterpret_cast<const float*>(address);
+  return true;
+}
+
+uintptr_t StripTodPointerFlags(uintptr_t value) {
+  return value & ~static_cast<uintptr_t>(3);
+}
+
+uintptr_t TodModuleBase() {
+  HMODULE exeModule = GetModuleHandleA(nullptr);
+  return exeModule != nullptr ? reinterpret_cast<uintptr_t>(exeModule) : 0;
+}
+
+const char* const kTodSkyTextureAssetPaths[] = {
+    "/data/Textures/Skybox/ClearBlueSky/ClearBlueSky/skybox_BK.bmp",
+    "/data/Textures/Skybox/ClearBlueSky/ClearBlueSky/skybox_FR.bmp",
+    "/data/Textures/Skybox/ClearBlueSky/ClearBlueSky/skybox_LF.bmp",
+    "/data/Textures/Skybox/ClearBlueSky/ClearBlueSky/skybox_RT.bmp",
+    "/data/Textures/Skybox/ClearBlueSky/ClearBlueSky/skybox_UP.bmp",
+    "/data/Textures/Skybox/RedDustSky/RedDustSky/skybox_BK.bmp",
+    "/data/Textures/Skybox/RedDustSky/RedDustSky/skybox_FR.bmp",
+    "/data/Textures/Skybox/RedDustSky/RedDustSky/skybox_LF.bmp",
+    "/data/Textures/Skybox/RedDustSky/RedDustSky/skybox_RT.bmp",
+    "/data/Textures/Skybox/RedDustSky/RedDustSky/skybox_UP.bmp",
+    "/data/Textures/Skybox/Sky/cloudSky/skybox_BK.bmp",
+    "/data/Textures/Skybox/Sky/cloudSky/skybox_FR.bmp",
+    "/data/Textures/Skybox/Sky/cloudSky/skybox_LF.bmp",
+    "/data/Textures/Skybox/Sky/cloudSky/skybox_RT.bmp",
+    "/data/Textures/Skybox/Sky/cloudSky/skybox_UP.bmp",
+    "/data/Textures/Skybox/Skybox_DAWN/Skybox_DAWN/skybox_BK.bmp",
+    "/data/Textures/Skybox/Skybox_DAWN/Skybox_DAWN/skybox_FR.bmp",
+    "/data/Textures/Skybox/Skybox_DAWN/Skybox_DAWN/skybox_LF.bmp",
+    "/data/Textures/Skybox/Skybox_DAWN/Skybox_DAWN/skybox_RT.bmp",
+    "/data/Textures/Skybox/Skybox_DAWN/Skybox_DAWN/skybox_UP.bmp",
+    "/data/Textures/Skybox/Skybox_DAY_OF_THE_DEAD/Skybox_DAY_OF_THE_DEAD/skybox_BK.bmp",
+    "/data/Textures/Skybox/Skybox_DAY_OF_THE_DEAD/Skybox_DAY_OF_THE_DEAD/skybox_FR.bmp",
+    "/data/Textures/Skybox/Skybox_DAY_OF_THE_DEAD/Skybox_DAY_OF_THE_DEAD/skybox_LF.bmp",
+    "/data/Textures/Skybox/Skybox_DAY_OF_THE_DEAD/Skybox_DAY_OF_THE_DEAD/skybox_RT.bmp",
+    "/data/Textures/Skybox/Skybox_DAY_OF_THE_DEAD/Skybox_DAY_OF_THE_DEAD/skybox_UP.bmp",
+    "/data/Textures/Skybox/Skybox_NIGHT/Skybox_NIGHT/skybox_BK.bmp",
+    "/data/Textures/Skybox/Skybox_NIGHT/Skybox_NIGHT/skybox_FR.bmp",
+    "/data/Textures/Skybox/Skybox_NIGHT/Skybox_NIGHT/skybox_LF.bmp",
+    "/data/Textures/Skybox/Skybox_NIGHT/Skybox_NIGHT/skybox_RT.bmp",
+    "/data/Textures/Skybox/Skybox_NIGHT/Skybox_NIGHT/skybox_UP.bmp",
+    "/data/textures/materials/map06_virgillosmap_test/SkyHorison _Light.bmp",
+};
+
+bool TryGetTodSkyMeshBuffers(
+    int index,
+    IDirect3DVertexBuffer9** vertexBuffer,
+    IDirect3DIndexBuffer9** indexBuffer) {
+  if (vertexBuffer == nullptr || indexBuffer == nullptr || index < 0 || index >= kTodSkyMeshCount) {
+    return false;
+  }
+
+  *vertexBuffer = nullptr;
+  *indexBuffer = nullptr;
+
+  const uintptr_t moduleBase = TodModuleBase();
+  if (moduleBase == 0) {
+    return false;
+  }
+
+  uintptr_t mesh = 0;
+  const uintptr_t meshSlot = moduleBase + kTodSkyMeshArrayGlobalRva + sizeof(uintptr_t) * index;
+  if (!TryReadPointer(meshSlot, &mesh)) {
+    return false;
+  }
+
+  uintptr_t vertexBufferWrapper = 0;
+  uintptr_t indexBufferWrapper = 0;
+  if (!TryReadPointer(mesh + kTodRenderMeshVertexBufferOffset, &vertexBufferWrapper) ||
+      !TryReadPointer(mesh + kTodRenderMeshIndexBufferOffset, &indexBufferWrapper)) {
+    return false;
+  }
+
+  vertexBufferWrapper = StripTodPointerFlags(vertexBufferWrapper);
+  indexBufferWrapper = StripTodPointerFlags(indexBufferWrapper);
+  if (vertexBufferWrapper == 0 || indexBufferWrapper == 0) {
+    return false;
+  }
+
+  uintptr_t vertexBufferPtr = 0;
+  uintptr_t indexBufferPtr = 0;
+  if (!TryReadPointer(vertexBufferWrapper + kTodVertexBufferD3DOffset, &vertexBufferPtr) ||
+      !TryReadPointer(indexBufferWrapper + kTodIndexBufferD3DOffset, &indexBufferPtr)) {
+    return false;
+  }
+
+  vertexBufferPtr = StripTodPointerFlags(vertexBufferPtr);
+  indexBufferPtr = StripTodPointerFlags(indexBufferPtr);
+  if (vertexBufferPtr == 0 || indexBufferPtr == 0) {
+    return false;
+  }
+
+  *vertexBuffer = reinterpret_cast<IDirect3DVertexBuffer9*>(vertexBufferPtr);
+  *indexBuffer = reinterpret_cast<IDirect3DIndexBuffer9*>(indexBufferPtr);
+  return true;
+}
+
+bool CurrentDrawUsesTodSkyMesh(IDirect3DDevice9* device, const LayoutState& layout) {
+  if ((!kMarkTodSkyDrawsWithViewportMinZ && !kEnableTodSkyTextureDiscovery) || device == nullptr) {
+    return false;
+  }
+
+  if (layout.fvfRhw || layout.declarationPositionT || layout.shaderActive) {
+    return false;
+  }
+
+  IDirect3DVertexBuffer9* currentVertexBuffer = nullptr;
+  UINT streamOffset = 0;
+  UINT streamStride = 0;
+  if (FAILED(device->GetStreamSource(0, &currentVertexBuffer, &streamOffset, &streamStride)) ||
+      currentVertexBuffer == nullptr) {
+    return false;
+  }
+
+  IDirect3DIndexBuffer9* currentIndexBuffer = nullptr;
+  if (FAILED(device->GetIndices(&currentIndexBuffer)) || currentIndexBuffer == nullptr) {
+    currentVertexBuffer->Release();
+    return false;
+  }
+
+  bool matched = false;
+  for (int i = 0; i < kTodSkyMeshCount; ++i) {
+    IDirect3DVertexBuffer9* skyVertexBuffer = nullptr;
+    IDirect3DIndexBuffer9* skyIndexBuffer = nullptr;
+    if (TryGetTodSkyMeshBuffers(i, &skyVertexBuffer, &skyIndexBuffer) &&
+        currentVertexBuffer == skyVertexBuffer &&
+        currentIndexBuffer == skyIndexBuffer) {
+      matched = true;
+      break;
+    }
+  }
+
+  currentIndexBuffer->Release();
+  currentVertexBuffer->Release();
+  return matched;
+}
+
+bool ApplyTodSkyViewportMarker(IDirect3DDevice9* device, D3DVIEWPORT9* savedViewport) {
+  if (!kMarkTodSkyDrawsWithViewportMinZ || device == nullptr || savedViewport == nullptr) {
+    return false;
+  }
+
+  if (FAILED(device->GetViewport(savedViewport))) {
+    return false;
+  }
+
+  D3DVIEWPORT9 skyViewport = *savedViewport;
+  skyViewport.MinZ = kTodSkyViewportMinZ;
+  skyViewport.MaxZ = 1.0f;
+  if (FAILED(device->SetViewport(&skyViewport))) {
+    return false;
+  }
+
+  InterlockedIncrement(const_cast<LONG*>(&g_todSkyViewportMarks));
+  return true;
+}
+
+bool IsFiniteFloat(float value) {
+  return value == value && value > -3.402823e38f && value < 3.402823e38f;
+}
+
+bool IsSaneTodCameraClipPair(float nearClip, float farClip) {
+  return IsFiniteFloat(nearClip) && IsFiniteFloat(farClip) &&
+      nearClip >= 0.01f && nearClip <= 10.0f &&
+      farClip >= 10.0f && farClip <= 10000.0f &&
+      farClip > nearClip;
+}
+
+bool PatchTodCameraFarClip(uintptr_t camera) {
+  if (!kPatchTodCameraFarClip || camera == 0) {
+    return false;
+  }
+
+  const uintptr_t nearClipAddress = camera + kTodCameraNearClipOffset;
+  const uintptr_t farClipAddress = camera + kTodCameraFarClipOffset;
+  if (nearClipAddress < camera || farClipAddress < camera ||
+      !IsCommittedMemoryRange(farClipAddress, sizeof(float), true)) {
+    return false;
+  }
+
+  float nearClip = 0.0f;
+  float farClip = 0.0f;
+  if (!TryReadFloat(nearClipAddress, &nearClip) || !TryReadFloat(farClipAddress, &farClip) ||
+      !IsSaneTodCameraClipPair(nearClip, farClip)) {
+    return false;
+  }
+
+  if (farClip >= kTodCameraFarClipOverride - 1.0f) {
+    return false;
+  }
+
+  *reinterpret_cast<float*>(farClipAddress) = kTodCameraFarClipOverride;
+  const LONG patches = InterlockedIncrement(const_cast<LONG*>(&g_cameraFarClipPatches));
+  if (patches <= 10 || (patches % 300) == 0) {
+    Log(
+        "TOD camera farclip override #%ld: camera=%p near=%.3f oldFar=%.3f newFar=%.3f",
+        patches,
+        reinterpret_cast<void*>(camera),
+        nearClip,
+        farClip,
+        kTodCameraFarClipOverride);
+  }
+  return true;
+}
+
+void PatchTodCameraSlot(uintptr_t cameraSystem, uintptr_t slotOffset, uintptr_t* patchedCameraA, uintptr_t* patchedCameraB) {
+  uintptr_t camera = 0;
+  if (!TryReadPointer(cameraSystem + slotOffset, &camera)) {
+    return;
+  }
+
+  if ((patchedCameraA != nullptr && camera == *patchedCameraA) ||
+      (patchedCameraB != nullptr && camera == *patchedCameraB)) {
+    return;
+  }
+
+  if (PatchTodCameraFarClip(camera)) {
+    if (patchedCameraA != nullptr && *patchedCameraA == 0) {
+      *patchedCameraA = camera;
+    } else if (patchedCameraB != nullptr && *patchedCameraB == 0) {
+      *patchedCameraB = camera;
+    }
+  }
+}
+
+void ApplyTodCameraFarClipOverride() {
+  if (!kPatchTodCameraFarClip) {
+    return;
+  }
+
+  HMODULE exeModule = GetModuleHandleA(nullptr);
+  if (exeModule == nullptr) {
+    return;
+  }
+
+  const uintptr_t moduleBase = reinterpret_cast<uintptr_t>(exeModule);
+  const uintptr_t cameraSystemGlobal = moduleBase + kTodCameraSystemGlobalRva;
+  uintptr_t cameraSystem = 0;
+  if (!TryReadPointer(cameraSystemGlobal, &cameraSystem)) {
+    return;
+  }
+
+  uintptr_t patchedCameraA = 0;
+  uintptr_t patchedCameraB = 0;
+  PatchTodCameraSlot(cameraSystem, kTodCameraSlotCurrentOffset, &patchedCameraA, &patchedCameraB);
+  PatchTodCameraSlot(cameraSystem, kTodCameraSlotPrimaryOffset, &patchedCameraA, &patchedCameraB);
+  PatchTodCameraSlot(cameraSystem, kTodCameraSlotSecondaryOffset, &patchedCameraA, &patchedCameraB);
+}
 
 bool NearlyEqual(float a, float b) {
   const float delta = a - b;
@@ -674,6 +1200,875 @@ const TextureInfo* FindTextureInfo(IDirect3DBaseTexture9* texture) {
   }
 
   return nullptr;
+}
+
+DWORD MakeFourCc(char a, char b, char c, char d) {
+  return static_cast<DWORD>(static_cast<BYTE>(a)) |
+      (static_cast<DWORD>(static_cast<BYTE>(b)) << 8) |
+      (static_cast<DWORD>(static_cast<BYTE>(c)) << 16) |
+      (static_cast<DWORD>(static_cast<BYTE>(d)) << 24);
+}
+
+bool ReadTextureLevel0Packed(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    BYTE** packedData,
+    SIZE_T* packedSize,
+    UINT* outRowBytes,
+    UINT* outRowCount) {
+  if (texture == nullptr || info == nullptr || packedData == nullptr || packedSize == nullptr ||
+      texture->GetType() != D3DRTYPE_TEXTURE) {
+    return false;
+  }
+
+  UINT rowBytes = 0;
+  UINT rowCount = 0;
+  if (!ComputeTextureCopyLayout(info->format, info->width, info->height, &rowBytes, &rowCount)) {
+    return false;
+  }
+
+  IDirect3DTexture9* texture2D = static_cast<IDirect3DTexture9*>(texture);
+  D3DLOCKED_RECT locked = {};
+  const HRESULT lockResult = texture2D->LockRect(0, &locked, nullptr, D3DLOCK_READONLY);
+  if (FAILED(lockResult) || locked.pBits == nullptr) {
+    return false;
+  }
+
+  if (locked.Pitch <= 0 || static_cast<UINT>(locked.Pitch) < rowBytes) {
+    texture2D->UnlockRect(0);
+    return false;
+  }
+
+  const UINT packedRowBytes = (rowBytes + 3u) & ~3u;
+  const SIZE_T levelDataSize = static_cast<SIZE_T>(packedRowBytes) * rowCount;
+  if (levelDataSize == 0 || levelDataSize > (64u * 1024u * 1024u)) {
+    texture2D->UnlockRect(0);
+    return false;
+  }
+
+  BYTE* packed = static_cast<BYTE*>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, levelDataSize));
+  if (packed == nullptr) {
+    texture2D->UnlockRect(0);
+    return false;
+  }
+
+  const BYTE* base = static_cast<const BYTE*>(locked.pBits);
+  for (UINT y = 0; y < rowCount; ++y) {
+    const BYTE* row = base + static_cast<int>(y) * locked.Pitch;
+    CopyMemory(packed + static_cast<SIZE_T>(y) * packedRowBytes, row, rowBytes);
+  }
+
+  texture2D->UnlockRect(0);
+  *packedData = packed;
+  *packedSize = levelDataSize;
+  if (outRowBytes != nullptr) {
+    *outRowBytes = rowBytes;
+  }
+  if (outRowCount != nullptr) {
+    *outRowCount = rowCount;
+  }
+  return true;
+}
+
+bool ComputeRtxTextureHash(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long* rtxHash) {
+  if (rtxHash == nullptr) {
+    return false;
+  }
+
+  BYTE* packed = nullptr;
+  SIZE_T packedSize = 0;
+  if (!ReadTextureLevel0Packed(texture, info, &packed, &packedSize, nullptr, nullptr)) {
+    return false;
+  }
+
+  *rtxHash = XXH3_64bits(packed, packedSize);
+  HeapFree(GetProcessHeap(), 0, packed);
+  return true;
+}
+
+bool FillDdsHeader(const TextureInfo* info, UINT rowBytes, UINT rowCount, DdsHeader* header) {
+  if (info == nullptr || header == nullptr) {
+    return false;
+  }
+
+  *header = {};
+  header->size = 124;
+  header->flags = kDdsdCaps | kDdsdHeight | kDdsdWidth | kDdsdPixelFormat;
+  header->height = info->height;
+  header->width = info->width;
+  header->pixelFormat.size = 32;
+  header->caps = kDdsCapsTexture;
+
+  switch (info->format) {
+    case D3DFMT_DXT1:
+      header->flags |= kDdsdLinearSize;
+      header->pitchOrLinearSize = rowBytes * rowCount;
+      header->pixelFormat.flags = kDdpfFourCc;
+      header->pixelFormat.fourCc = MakeFourCc('D', 'X', 'T', '1');
+      return true;
+    case D3DFMT_DXT3:
+      header->flags |= kDdsdLinearSize;
+      header->pitchOrLinearSize = rowBytes * rowCount;
+      header->pixelFormat.flags = kDdpfFourCc;
+      header->pixelFormat.fourCc = MakeFourCc('D', 'X', 'T', '3');
+      return true;
+    case D3DFMT_DXT5:
+      header->flags |= kDdsdLinearSize;
+      header->pitchOrLinearSize = rowBytes * rowCount;
+      header->pixelFormat.flags = kDdpfFourCc;
+      header->pixelFormat.fourCc = MakeFourCc('D', 'X', 'T', '5');
+      return true;
+    case D3DFMT_A8R8G8B8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfRgb | kDdpfAlphaPixels;
+      header->pixelFormat.rgbBitCount = 32;
+      header->pixelFormat.rBitMask = 0x00FF0000u;
+      header->pixelFormat.gBitMask = 0x0000FF00u;
+      header->pixelFormat.bBitMask = 0x000000FFu;
+      header->pixelFormat.aBitMask = 0xFF000000u;
+      return true;
+    case D3DFMT_X8R8G8B8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfRgb;
+      header->pixelFormat.rgbBitCount = 32;
+      header->pixelFormat.rBitMask = 0x00FF0000u;
+      header->pixelFormat.gBitMask = 0x0000FF00u;
+      header->pixelFormat.bBitMask = 0x000000FFu;
+      return true;
+    case D3DFMT_A8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfAlpha;
+      header->pixelFormat.rgbBitCount = 8;
+      header->pixelFormat.aBitMask = 0x000000FFu;
+      return true;
+    case D3DFMT_L8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfLuminance;
+      header->pixelFormat.rgbBitCount = 8;
+      header->pixelFormat.rBitMask = 0x000000FFu;
+      return true;
+    case D3DFMT_A8L8:
+      header->flags |= kDdsdPitch;
+      header->pitchOrLinearSize = rowBytes;
+      header->pixelFormat.flags = kDdpfLuminance | kDdpfAlphaPixels;
+      header->pixelFormat.rgbBitCount = 16;
+      header->pixelFormat.rBitMask = 0x000000FFu;
+      header->pixelFormat.aBitMask = 0x0000FF00u;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void DumpTextureDds(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long rtxHash,
+    const char* filePrefix,
+    const char* dumpDir,
+    const char* fallbackDumpDir) {
+  if (texture == nullptr || info == nullptr || filePrefix == nullptr) {
+    return;
+  }
+
+  BYTE* packed = nullptr;
+  SIZE_T packedSize = 0;
+  UINT rowBytes = 0;
+  UINT rowCount = 0;
+  if (!ReadTextureLevel0Packed(texture, info, &packed, &packedSize, &rowBytes, &rowCount)) {
+    return;
+  }
+
+  DdsHeader header = {};
+  if (!FillDdsHeader(info, rowBytes, rowCount, &header)) {
+    HeapFree(GetProcessHeap(), 0, packed);
+    return;
+  }
+
+  char path[MAX_PATH * 3] = {};
+  snprintf(
+      path,
+      sizeof(path),
+      "%s\\%s_%016llX_%ux%u_%s.dds",
+      dumpDir != nullptr && dumpDir[0] != '\0' ? dumpDir : fallbackDumpDir,
+      filePrefix,
+      rtxHash,
+      info->width,
+      info->height,
+      FormatName(info->format));
+
+  if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) {
+    HeapFree(GetProcessHeap(), 0, packed);
+    return;
+  }
+
+  LockLog();
+  EnsureLogDirectory();
+  HANDLE file = CreateFileA(
+      path,
+      GENERIC_WRITE,
+      FILE_SHARE_READ,
+      nullptr,
+      CREATE_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    const DWORD magic = MakeFourCc('D', 'D', 'S', ' ');
+    WriteFile(file, &magic, sizeof(magic), &written, nullptr);
+    WriteFile(file, &header, sizeof(header), &written, nullptr);
+    WriteFile(file, packed, static_cast<DWORD>(packedSize), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+
+  HeapFree(GetProcessHeap(), 0, packed);
+}
+
+void DumpTodSkyTextureDds(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long rtxHash) {
+  DumpTextureDds(
+      texture,
+      info,
+      rtxHash,
+      "skybox",
+      g_todSkyTextureDumpDir,
+      "rtx-remix\\logs\\tod-sky-textures");
+}
+
+void DumpTodForcedTextureProbeDds(
+    IDirect3DBaseTexture9* texture,
+    const TextureInfo* info,
+    unsigned long long rtxHash) {
+  DumpTextureDds(
+      texture,
+      info,
+      rtxHash,
+      "texture",
+      g_todForcedTextureProbeDumpDir,
+      "rtx-remix\\logs\\tod-forced-texture-probe");
+}
+
+TodSkyTextureRecord* FindTodSkyTextureRecord(
+    IDirect3DBaseTexture9* texture,
+    unsigned long long hash,
+    bool valid) {
+  const LONG count = ClampedCount(&g_todSkyTextureRecordCount, kMaxTodSkyTextureRecords);
+  for (LONG i = 0; i < count; ++i) {
+    TodSkyTextureRecord& record = g_todSkyTextureRecords[i];
+    if (record.texture == texture) {
+      return &record;
+    }
+    if (valid && record.valid && record.hash == hash) {
+      return &record;
+    }
+  }
+  return nullptr;
+}
+
+bool TodSkyTextureRecordExists(
+    IDirect3DBaseTexture9* texture,
+    unsigned long long hash,
+    bool valid) {
+  return FindTodSkyTextureRecord(texture, hash, valid) != nullptr;
+}
+
+// Whether the texture (by pointer only, the identity available at queue time)
+// has already produced a sky_draw_marked row. Used to dedup draw entries
+// without blocking them behind the earlier material-bind record.
+bool TodSkyTextureKeyDrawnLogged(IDirect3DBaseTexture9* textureKey) {
+  if (textureKey == nullptr) {
+    return false;
+  }
+  const LONG count = ClampedCount(&g_todSkyTextureRecordCount, kMaxTodSkyTextureRecords);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_todSkyTextureRecords[i].texture == textureKey) {
+      return g_todSkyTextureRecords[i].drawnLogged;
+    }
+  }
+  return false;
+}
+
+void AddTodSkyTextureRecord(
+    IDirect3DBaseTexture9* texture,
+    unsigned long long hash,
+    bool valid,
+    bool drawnLogged) {
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_todSkyTextureRecordCount)) - 1;
+  if (index < 0 || index >= kMaxTodSkyTextureRecords) {
+    return;
+  }
+  g_todSkyTextureRecords[index].texture = texture;
+  g_todSkyTextureRecords[index].hash = hash;
+  g_todSkyTextureRecords[index].valid = valid;
+  g_todSkyTextureRecords[index].drawnLogged = drawnLogged;
+}
+
+void AppendTodSkyTextureRow(
+    const char* status,
+    IDirect3DBaseTexture9* sourceTexture,
+    IDirect3DBaseTexture9* boundTexture,
+    const TextureInfo* info,
+    unsigned long long hash,
+    bool hashValid,
+    LONG skyDraws,
+    UINT primitiveCount,
+    UINT numVertices) {
+  const LONG row = InterlockedIncrement(const_cast<LONG*>(&g_todSkyTextureRows));
+  char line[1024] = {};
+  snprintf(
+      line,
+      sizeof(line),
+      "%ld\t%s\t%p\t%p\t%s0x%016llX\t%u\t%u\t%s\t%u\t0x%08lx\t%u\t%ld\t%u\t%u\r\n",
+      row,
+      status != nullptr ? status : "unknown",
+      sourceTexture,
+      boundTexture,
+      hashValid ? "" : "invalid:",
+      hash,
+      info != nullptr ? info->width : 0,
+      info != nullptr ? info->height : 0,
+      info != nullptr ? FormatName(info->format) : "unknown",
+      info != nullptr ? info->levels : 0,
+      info != nullptr ? info->usage : 0,
+      info != nullptr ? static_cast<unsigned>(info->pool) : 0,
+      skyDraws,
+      primitiveCount,
+      numVertices);
+
+  const char* path =
+      g_todSkyTextureLogPath[0] != '\0' ? g_todSkyTextureLogPath : "rtx-remix\\logs\\tod-sky-textures.tsv";
+  const bool newFile = GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES;
+
+  LockLog();
+  EnsureLogDirectory();
+  HANDLE file = CreateFileA(
+      path,
+      FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    if (newFile) {
+      const char* header =
+          "row\tstatus\tsourceTexture\tboundTexture\trtxTextureHash\twidth\theight\tformat\tlevels\tusage\tpool"
+          "\tskyDraw\tprimitiveCount\tnumVertices\r\n";
+      WriteFile(file, header, static_cast<DWORD>(strlen(header)), &written, nullptr);
+    }
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+}
+
+bool TodSkyTexturePendingOrRecorded(IDirect3DBaseTexture9* textureKey) {
+  if (textureKey == nullptr || TodSkyTextureRecordExists(textureKey, 0, false)) {
+    return true;
+  }
+
+  const LONG maxPending = static_cast<LONG>(sizeof(g_todSkyTexturePending) / sizeof(g_todSkyTexturePending[0]));
+  const LONG pendingCount = ClampedCount(&g_todSkyTexturePendingCount, maxPending);
+  for (LONG i = 0; i < pendingCount; ++i) {
+    const IDirect3DBaseTexture9* pendingKey = g_todSkyTexturePending[i].sourceTexture != nullptr
+        ? g_todSkyTexturePending[i].sourceTexture
+        : g_todSkyTexturePending[i].boundTexture;
+    if (pendingKey == textureKey) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+// Whether a marked-draw entry (skyDraws >= 1) for this key is already queued
+// this batch, so we only emit one sky_draw_marked per distinct texture.
+bool TodSkyDrawPending(IDirect3DBaseTexture9* textureKey) {
+  const LONG maxPending = static_cast<LONG>(sizeof(g_todSkyTexturePending) / sizeof(g_todSkyTexturePending[0]));
+  const LONG pendingCount = ClampedCount(&g_todSkyTexturePendingCount, maxPending);
+  for (LONG i = 0; i < pendingCount; ++i) {
+    if (g_todSkyTexturePending[i].skyDraws < 1) {
+      continue;
+    }
+    const IDirect3DBaseTexture9* pendingKey = g_todSkyTexturePending[i].sourceTexture != nullptr
+        ? g_todSkyTexturePending[i].sourceTexture
+        : g_todSkyTexturePending[i].boundTexture;
+    if (pendingKey == textureKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void QueueTodSkyTexture(
+    IDirect3DBaseTexture9* sourceTexture,
+    IDirect3DBaseTexture9* boundTexture,
+    LONG skyDraws,
+    UINT primitiveCount,
+    UINT numVertices) {
+  if (!kEnableTodSkyTextureDiscovery) {
+    return;
+  }
+
+  IDirect3DBaseTexture9* textureKey = sourceTexture != nullptr ? sourceTexture : boundTexture;
+  const bool isDraw = skyDraws >= 1;
+  if (!isDraw) {
+    // Material bind: dedup against any prior record or pending entry.
+    if (TodSkyTexturePendingOrRecorded(textureKey)) {
+      return;
+    }
+  } else {
+    // Marked sky draw: allow through even if already bound as a material, so we
+    // can record that this texture actually reached a MinZ-marked draw. Only
+    // dedup against an already-logged draw or a draw already pending this batch.
+    if (TodSkyTextureKeyDrawnLogged(textureKey) || TodSkyDrawPending(textureKey)) {
+      return;
+    }
+  }
+
+  const LONG maxPending = static_cast<LONG>(sizeof(g_todSkyTexturePending) / sizeof(g_todSkyTexturePending[0]));
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_todSkyTexturePendingCount)) - 1;
+  if (index < 0 || index >= maxPending) {
+    return;
+  }
+
+  if (sourceTexture != nullptr) {
+    sourceTexture->AddRef();
+  }
+  if (boundTexture != nullptr && boundTexture != sourceTexture) {
+    boundTexture->AddRef();
+  }
+  g_todSkyTexturePending[index].sourceTexture = sourceTexture;
+  g_todSkyTexturePending[index].boundTexture = boundTexture;
+  g_todSkyTexturePending[index].skyDraws = skyDraws;
+  g_todSkyTexturePending[index].primitiveCount = primitiveCount;
+  g_todSkyTexturePending[index].numVertices = numVertices;
+}
+
+void QueueTodSkyTextureForDraw(LONG skyDraws, UINT primitiveCount, UINT numVertices) {
+  IDirect3DBaseTexture9* sourceTexture =
+      g_currentSourceTexture0 != nullptr ? g_currentSourceTexture0 : g_currentTexture0;
+  QueueTodSkyTexture(sourceTexture, g_currentTexture0, skyDraws, primitiveCount, numVertices);
+}
+
+void ProcessQueuedTodSkyTextures() {
+  if (!kEnableTodSkyTextureDiscovery) {
+    return;
+  }
+
+  const LONG maxPending = static_cast<LONG>(sizeof(g_todSkyTexturePending) / sizeof(g_todSkyTexturePending[0]));
+  LONG pendingCount = InterlockedExchange(const_cast<LONG*>(&g_todSkyTexturePendingCount), 0);
+  if (pendingCount > maxPending) {
+    pendingCount = maxPending;
+  }
+
+  for (LONG i = 0; i < pendingCount; ++i) {
+    TodSkyTexturePending pending = g_todSkyTexturePending[i];
+    g_todSkyTexturePending[i] = {};
+
+    IDirect3DBaseTexture9* sourceTexture = pending.sourceTexture;
+    IDirect3DBaseTexture9* hashTexture = sourceTexture;
+    const TextureInfo* info = FindTextureInfo(hashTexture);
+    const bool sourceUsable =
+        hashTexture != nullptr && info != nullptr && hashTexture->GetType() == D3DRTYPE_TEXTURE;
+    bool usedBoundFallback = false;
+    if (!sourceUsable && pending.boundTexture != nullptr && pending.boundTexture != sourceTexture) {
+      const TextureInfo* boundInfo = FindTextureInfo(pending.boundTexture);
+      if (boundInfo != nullptr && pending.boundTexture->GetType() == D3DRTYPE_TEXTURE) {
+        hashTexture = pending.boundTexture;
+        info = boundInfo;
+        usedBoundFallback = true;
+      }
+    }
+
+    const bool isDraw = pending.skyDraws >= 1;
+
+    if (hashTexture == nullptr || info == nullptr || hashTexture->GetType() != D3DRTYPE_TEXTURE) {
+      if (!TodSkyTextureRecordExists(hashTexture, 0, false)) {
+        AddTodSkyTextureRecord(hashTexture, 0, false, isDraw);
+        AppendTodSkyTextureRow(
+            isDraw ? "sky_draw_no_texture_info" : "no_texture_info",
+            sourceTexture,
+            pending.boundTexture,
+            info,
+            0,
+            false,
+            pending.skyDraws,
+            pending.primitiveCount,
+            pending.numVertices);
+      }
+      if (sourceTexture != nullptr) {
+        sourceTexture->Release();
+      }
+      if (pending.boundTexture != nullptr && pending.boundTexture != sourceTexture) {
+        pending.boundTexture->Release();
+      }
+      continue;
+    }
+
+    unsigned long long rtxHash = 0;
+    const bool hashValid = ComputeRtxTextureHash(hashTexture, info, &rtxHash);
+    TodSkyTextureRecord* record = FindTodSkyTextureRecord(hashTexture, rtxHash, hashValid);
+    if (record == nullptr) {
+      // First time we have seen this sky texture at all.
+      AddTodSkyTextureRecord(hashTexture, rtxHash, hashValid, isDraw);
+      if (hashValid) {
+        DumpTodSkyTextureDds(hashTexture, info, rtxHash);
+      }
+      const char* status = isDraw
+          ? "sky_draw_marked"
+          : (hashValid ? (usedBoundFallback ? "ok_bound_fallback" : "ok") : "hash_failed");
+      AppendTodSkyTextureRow(
+          status,
+          sourceTexture,
+          pending.boundTexture,
+          info,
+          rtxHash,
+          hashValid,
+          pending.skyDraws,
+          pending.primitiveCount,
+          pending.numVertices);
+    } else if (isDraw && !record->drawnLogged) {
+      // Already seen as a material bind; now confirmed it reaches a MinZ-marked
+      // sky draw. Emit a separate row so the marked subset is visible.
+      record->drawnLogged = true;
+      AppendTodSkyTextureRow(
+          "sky_draw_marked",
+          sourceTexture,
+          pending.boundTexture,
+          info,
+          rtxHash,
+          hashValid,
+          pending.skyDraws,
+          pending.primitiveCount,
+          pending.numVertices);
+    }
+    if (sourceTexture != nullptr) {
+      sourceTexture->Release();
+    }
+    if (pending.boundTexture != nullptr && pending.boundTexture != sourceTexture) {
+      pending.boundTexture->Release();
+    }
+  }
+}
+
+bool TodForcedTextureRecordExists(
+    IDirect3DBaseTexture9* texture,
+    unsigned long long hash,
+    bool valid) {
+  const LONG count = ClampedCount(&g_todForcedTextureRecordCount, kMaxTodForcedTextureRecords);
+  for (LONG i = 0; i < count; ++i) {
+    const TodForcedTextureRecord& record = g_todForcedTextureRecords[i];
+    if (record.texture == texture) {
+      return true;
+    }
+    if (valid && record.valid && record.hash == hash) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void AddTodForcedTextureRecord(
+    IDirect3DBaseTexture9* texture,
+    unsigned long long hash,
+    bool valid) {
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_todForcedTextureRecordCount)) - 1;
+  if (index < 0 || index >= kMaxTodForcedTextureRecords) {
+    return;
+  }
+  g_todForcedTextureRecords[index].texture = texture;
+  g_todForcedTextureRecords[index].hash = hash;
+  g_todForcedTextureRecords[index].valid = valid;
+}
+
+void AppendTodForcedTextureProbeRow(
+    const char* status,
+    IDirect3DBaseTexture9* sourceTexture,
+    IDirect3DBaseTexture9* boundTexture,
+    const TextureInfo* info,
+    unsigned long long hash,
+    bool hashValid,
+    LONG probeFrame) {
+  const LONG row = InterlockedIncrement(const_cast<LONG*>(&g_todForcedTextureRows));
+  char line[1024] = {};
+  snprintf(
+      line,
+      sizeof(line),
+      "%ld\t%s\t%p\t%p\t%s0x%016llX\t%u\t%u\t%s\t%u\t0x%08lx\t%u\t%ld\r\n",
+      row,
+      status != nullptr ? status : "unknown",
+      sourceTexture,
+      boundTexture,
+      hashValid ? "" : "invalid:",
+      hash,
+      info != nullptr ? info->width : 0,
+      info != nullptr ? info->height : 0,
+      info != nullptr ? FormatName(info->format) : "unknown",
+      info != nullptr ? info->levels : 0,
+      info != nullptr ? info->usage : 0,
+      info != nullptr ? static_cast<unsigned>(info->pool) : 0,
+      probeFrame);
+
+  const char* path = g_todForcedTextureProbeLogPath[0] != '\0'
+      ? g_todForcedTextureProbeLogPath
+      : "rtx-remix\\logs\\tod-forced-texture-probe.tsv";
+  const bool newFile = GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES;
+
+  LockLog();
+  EnsureLogDirectory();
+  HANDLE file = CreateFileA(
+      path,
+      FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    if (newFile) {
+      const char* header =
+          "row\tstatus\tsourceTexture\tboundTexture\trtxTextureHash\twidth\theight\tformat\tlevels\tusage\tpool"
+          "\tprobeFrame\r\n";
+      WriteFile(file, header, static_cast<DWORD>(strlen(header)), &written, nullptr);
+    }
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+}
+
+bool TodForcedTexturePendingOrRecorded(IDirect3DBaseTexture9* texture) {
+  if (texture == nullptr || TodForcedTextureRecordExists(texture, 0, false)) {
+    return true;
+  }
+
+  const LONG pendingCount = ClampedCount(&g_todForcedTexturePendingCount, kMaxTodForcedTexturePending);
+  for (LONG i = 0; i < pendingCount; ++i) {
+    if (g_todForcedTexturePending[i].sourceTexture == texture) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void QueueTodForcedTextureProbeTexture(
+    IDirect3DBaseTexture9* sourceTexture,
+    IDirect3DBaseTexture9* boundTexture) {
+  if (!kEnableTodTextureMapProbe || sourceTexture == nullptr) {
+    return;
+  }
+
+  const LONG activeFrame =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_todTextureMapProbeActive), 0, 0);
+  if (activeFrame <= 0 || TodForcedTexturePendingOrRecorded(sourceTexture)) {
+    return;
+  }
+
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_todForcedTexturePendingCount)) - 1;
+  if (index < 0 || index >= kMaxTodForcedTexturePending) {
+    return;
+  }
+
+  sourceTexture->AddRef();
+  g_todForcedTexturePending[index].sourceTexture = sourceTexture;
+  g_todForcedTexturePending[index].boundTexture = boundTexture;
+  g_todForcedTexturePending[index].probeFrame = activeFrame;
+}
+
+void ProcessQueuedTodForcedTextureProbeTextures() {
+  if (!kEnableTodTextureMapProbe) {
+    return;
+  }
+
+  LONG pendingCount = InterlockedExchange(const_cast<LONG*>(&g_todForcedTexturePendingCount), 0);
+  if (pendingCount > kMaxTodForcedTexturePending) {
+    pendingCount = kMaxTodForcedTexturePending;
+  }
+
+  for (LONG i = 0; i < pendingCount; ++i) {
+    TodForcedTexturePending pending = g_todForcedTexturePending[i];
+    g_todForcedTexturePending[i] = {};
+
+    IDirect3DBaseTexture9* sourceTexture = pending.sourceTexture;
+    const TextureInfo* info = FindTextureInfo(sourceTexture);
+    if (sourceTexture == nullptr || info == nullptr || sourceTexture->GetType() != D3DRTYPE_TEXTURE) {
+      if (!TodForcedTextureRecordExists(sourceTexture, 0, false)) {
+        AddTodForcedTextureRecord(sourceTexture, 0, false);
+        AppendTodForcedTextureProbeRow(
+            "no_texture_info",
+            sourceTexture,
+            pending.boundTexture,
+            info,
+            0,
+            false,
+            pending.probeFrame);
+      }
+      if (sourceTexture != nullptr) {
+        sourceTexture->Release();
+      }
+      continue;
+    }
+
+    unsigned long long rtxHash = 0;
+    const bool hashValid = ComputeRtxTextureHash(sourceTexture, info, &rtxHash);
+    if (!TodForcedTextureRecordExists(sourceTexture, rtxHash, hashValid)) {
+      AddTodForcedTextureRecord(sourceTexture, rtxHash, hashValid);
+      if (hashValid) {
+        DumpTodForcedTextureProbeDds(sourceTexture, info, rtxHash);
+      }
+      AppendTodForcedTextureProbeRow(
+          hashValid ? "ok" : "hash_failed",
+          sourceTexture,
+          pending.boundTexture,
+          info,
+          rtxHash,
+          hashValid,
+          pending.probeFrame);
+    }
+    sourceTexture->Release();
+  }
+}
+
+void AppendTodSkyAssetLoadProbeRow(
+    const char* status,
+    const char* resourcePath,
+    void* asset,
+    DWORD exceptionCode) {
+  const LONG row = InterlockedIncrement(const_cast<LONG*>(&g_todSkyAssetLoadProbeRows));
+  char line[1024] = {};
+  snprintf(
+      line,
+      sizeof(line),
+      "%ld\t%s\t%p\t0x%08lx\t%s\r\n",
+      row,
+      status != nullptr ? status : "unknown",
+      asset,
+      static_cast<unsigned long>(exceptionCode),
+      resourcePath != nullptr ? resourcePath : "");
+
+  const char* path = g_todSkyAssetLoadProbeLogPath[0] != '\0'
+      ? g_todSkyAssetLoadProbeLogPath
+      : "rtx-remix\\logs\\tod-sky-asset-load-probe.tsv";
+  const bool newFile = GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES;
+
+  LockLog();
+  EnsureLogDirectory();
+  HANDLE file = CreateFileA(
+      path,
+      FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    if (newFile) {
+      const char* header = "row\tstatus\tasset\texceptionCode\tresourcePath\r\n";
+      WriteFile(file, header, static_cast<DWORD>(strlen(header)), &written, nullptr);
+    }
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+}
+
+void RunTodSkyAssetLoadProbe() {
+  if (!kEnableTodSkyAssetLoadProbe) {
+    return;
+  }
+
+  if (InterlockedExchange(const_cast<LONG*>(&g_todSkyAssetLoadProbeDone), 1) != 0) {
+    return;
+  }
+
+  const uintptr_t moduleBase = TodModuleBase();
+  const uintptr_t loadFunctionAddress = moduleBase + kTodLoadNativeResourceRva;
+  const uintptr_t allocatorAddress = moduleBase + kTodTextureAssetAllocatorGlobalRva;
+  const uintptr_t loadFlagAddress = moduleBase + kTodTextureAssetLoadFlagGlobalRva;
+  if (moduleBase == 0 ||
+      !IsCommittedMemoryRange(loadFunctionAddress, 16, false) ||
+      !IsCommittedMemoryRange(allocatorAddress, sizeof(int), true) ||
+      !IsCommittedMemoryRange(loadFlagAddress, sizeof(BYTE), true)) {
+    AppendTodSkyAssetLoadProbeRow("probe_unavailable", "", nullptr, 0);
+    return;
+  }
+
+  int* textureAllocator = reinterpret_cast<int*>(allocatorAddress);
+  BYTE* textureLoadFlag = reinterpret_cast<BYTE*>(loadFlagAddress);
+  const int savedAllocator = *textureAllocator;
+  const BYTE savedLoadFlag = *textureLoadFlag;
+  TodLoadNativeResourceFn loadNativeResource =
+      reinterpret_cast<TodLoadNativeResourceFn>(loadFunctionAddress);
+
+  *textureAllocator = kTodTextureAssetAllocatorId;
+  *textureLoadFlag = 1;
+
+  const LONG pathCount = static_cast<LONG>(
+      sizeof(kTodSkyTextureAssetPaths) / sizeof(kTodSkyTextureAssetPaths[0]));
+  for (LONG i = 0; i < pathCount; ++i) {
+    const char* assetPath = kTodSkyTextureAssetPaths[i];
+    char pathBuffer[260] = {};
+    strcpy_s(pathBuffer, assetPath);
+
+    void* asset = nullptr;
+    DWORD exceptionCode = 0;
+    __try {
+      asset = loadNativeResource(pathBuffer);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+      exceptionCode = GetExceptionCode();
+    }
+
+    AppendTodSkyAssetLoadProbeRow(
+        exceptionCode != 0 ? "exception" : (asset != nullptr ? "loaded" : "null"),
+        assetPath,
+        asset,
+        exceptionCode);
+  }
+
+  *textureAllocator = savedAllocator;
+  *textureLoadFlag = savedLoadFlag;
+}
+
+void RunTodTextureMapProbe() {
+  if (!kEnableTodTextureMapProbe) {
+    return;
+  }
+
+  const LONG currentFrame =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_todTextureMapProbeFramesDone), 0, 0);
+  if (currentFrame >= kTodTextureMapProbeFrames) {
+    return;
+  }
+
+  const uintptr_t moduleBase = TodModuleBase();
+  const uintptr_t functionAddress = moduleBase + kTodTextureDrawAllTexturesRva;
+  if (moduleBase == 0 || !IsCommittedMemoryRange(functionAddress, 16, false)) {
+    return;
+  }
+
+  const LONG probeFrame = InterlockedIncrement(const_cast<LONG*>(&g_todTextureMapProbeFramesDone));
+  if (probeFrame <= 0 || probeFrame > kTodTextureMapProbeFrames) {
+    return;
+  }
+
+  InterlockedExchange(const_cast<LONG*>(&g_todTextureMapProbeActive), probeFrame);
+  reinterpret_cast<TodTextureDrawAllTexturesFn>(functionAddress)();
+  InterlockedExchange(const_cast<LONG*>(&g_todTextureMapProbeActive), 0);
 }
 
 bool IsRenderTargetTexture(IDirect3DBaseTexture9* texture) {
@@ -1032,6 +2427,388 @@ bool HookVtableSlot(void* object, DWORD index, Fn hook, Fn* original, const char
 
   Log("%s hook installed: slot=%p original=%p hook=%p", name, slot, previous, hookPtr);
   return true;
+}
+
+void AppendTodSkyTextureRow(
+    const char* status,
+    IDirect3DBaseTexture9* sourceTexture,
+    IDirect3DBaseTexture9* boundTexture,
+    const TextureInfo* info,
+    unsigned long long hash,
+    bool hashValid,
+    LONG skyDraws,
+    UINT primitiveCount,
+    UINT numVertices);
+void QueueTodSkyTexture(
+    IDirect3DBaseTexture9* sourceTexture,
+    IDirect3DBaseTexture9* boundTexture,
+    LONG skyDraws,
+    UINT primitiveCount,
+    UINT numVertices);
+
+uintptr_t NormalizeTodPointer(void* pointer) {
+  return StripTodPointerFlags(reinterpret_cast<uintptr_t>(pointer));
+}
+
+bool TodSkyRenderMeshRecorded(void* mesh) {
+  const uintptr_t meshAddress = NormalizeTodPointer(mesh);
+  if (meshAddress == 0) {
+    return false;
+  }
+
+  const LONG count = ClampedCount(&g_todSkyMeshRecords, kMaxTodSkyRenderMeshes);
+  for (LONG i = 0; i < count; ++i) {
+    if (g_todSkyRenderMeshes[i] == meshAddress) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+void RecordTodSkyRenderMesh(void* mesh) {
+  const uintptr_t meshAddress = NormalizeTodPointer(mesh);
+  if (meshAddress == 0 || TodSkyRenderMeshRecorded(mesh)) {
+    return;
+  }
+
+  const LONG index = InterlockedIncrement(const_cast<LONG*>(&g_todSkyMeshRecords)) - 1;
+  if (index < 0 || index >= kMaxTodSkyRenderMeshes) {
+    return;
+  }
+
+  g_todSkyRenderMeshes[index] = meshAddress;
+  if (index < 10) {
+    AppendTodSkyTextureRow("sky_mesh_recorded", nullptr, nullptr, nullptr, 0, false, -2, 0, 0);
+  }
+}
+
+void WriteAbsoluteJump6(BYTE* target, uintptr_t destination, SIZE_T patchBytes) {
+  target[0] = 0x68;
+  *reinterpret_cast<DWORD*>(target + 1) = static_cast<DWORD>(destination);
+  target[5] = 0xC3;
+  for (SIZE_T i = 6; i < patchBytes; ++i) {
+    target[i] = 0x90;
+  }
+}
+
+bool InstallInlineJumpHook(
+    uintptr_t target,
+    void* hook,
+    void** original,
+    SIZE_T patchBytes,
+    const char* name) {
+  if (target == 0 || hook == nullptr || original == nullptr || patchBytes < 6) {
+    Log("%s inline hook skipped: invalid input", name);
+    return false;
+  }
+
+  if (!IsCommittedMemoryRange(target, patchBytes, false)) {
+    Log("%s inline hook skipped: target unavailable at 0x%p", name, reinterpret_cast<void*>(target));
+    return false;
+  }
+
+  BYTE* targetBytes = reinterpret_cast<BYTE*>(target);
+  const SIZE_T trampolineBytes = patchBytes + 6;
+  BYTE* trampoline = reinterpret_cast<BYTE*>(VirtualAlloc(
+      nullptr,
+      trampolineBytes,
+      MEM_COMMIT | MEM_RESERVE,
+      PAGE_EXECUTE_READWRITE));
+  if (trampoline == nullptr) {
+    Log("%s inline hook failed: VirtualAlloc error=%lu", name, GetLastError());
+    return false;
+  }
+
+  memcpy(trampoline, targetBytes, patchBytes);
+  WriteAbsoluteJump6(trampoline + patchBytes, target + patchBytes, 6);
+
+  DWORD oldProtect = 0;
+  if (!VirtualProtect(targetBytes, patchBytes, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+    VirtualFree(trampoline, 0, MEM_RELEASE);
+    Log("%s inline hook failed: VirtualProtect error=%lu", name, GetLastError());
+    return false;
+  }
+
+  WriteAbsoluteJump6(targetBytes, reinterpret_cast<uintptr_t>(hook), patchBytes);
+
+  DWORD ignored = 0;
+  VirtualProtect(targetBytes, patchBytes, oldProtect, &ignored);
+  FlushInstructionCache(GetCurrentProcess(), targetBytes, patchBytes);
+  FlushInstructionCache(GetCurrentProcess(), trampoline, trampolineBytes);
+
+  *original = trampoline;
+  Log("%s inline hook installed: target=%p trampoline=%p hook=%p", name, targetBytes, trampoline, hook);
+  return true;
+}
+
+void __fastcall Hook_TodSkyBoxRender(void* self, void* edx) {
+  InterlockedIncrement(const_cast<LONG*>(&g_todSkyBoxRenderCalls));
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyBoxRenderFirstCallLogged), 1, 0) == 0) {
+    AppendTodSkyTextureRow("scope_entered", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+  }
+  InterlockedIncrement(const_cast<LONG*>(&g_todSkyBoxRenderDepth));
+  if (g_origTodSkyBoxRender != nullptr) {
+    g_origTodSkyBoxRender(self, edx);
+  }
+  InterlockedDecrement(const_cast<LONG*>(&g_todSkyBoxRenderDepth));
+}
+
+bool TryGetTodMaterialD3DTexture(void* material, IDirect3DBaseTexture9** texture) {
+  if (texture == nullptr) {
+    return false;
+  }
+  *texture = nullptr;
+
+  const uintptr_t materialAddress = reinterpret_cast<uintptr_t>(material);
+  if (materialAddress == 0 ||
+      !IsCommittedMemoryRange(materialAddress + sizeof(uintptr_t), sizeof(uintptr_t), false)) {
+    return false;
+  }
+
+  uintptr_t textureAddress = 0;
+  if (!TryReadPointer(materialAddress + sizeof(uintptr_t), &textureAddress)) {
+    return false;
+  }
+
+  textureAddress = StripTodPointerFlags(textureAddress);
+  if (textureAddress == 0) {
+    return false;
+  }
+
+  uintptr_t vtable = 0;
+  if (!TryReadPointer(textureAddress, &vtable)) {
+    return false;
+  }
+
+  *texture = reinterpret_cast<IDirect3DBaseTexture9*>(textureAddress);
+  return true;
+}
+
+void __fastcall Hook_TodRenderListSetMaterial(
+    void* self,
+    void* edx,
+    void* material,
+    DWORD stage) {
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyBoxRenderDepth), 0, 0) > 0) {
+    InterlockedIncrement(const_cast<LONG*>(&g_todSkyMaterialCommands));
+    IDirect3DBaseTexture9* texture = nullptr;
+    if (stage == 0 && TryGetTodMaterialD3DTexture(material, &texture)) {
+      QueueTodSkyTexture(texture, texture, 0, 0, 0);
+      InterlockedIncrement(const_cast<LONG*>(&g_todSkyScopedTextureQueues));
+    } else {
+      AppendTodSkyTextureRow("scope_material_no_texture", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    }
+  }
+
+  if (g_origTodRenderListSetMaterial != nullptr) {
+    g_origTodRenderListSetMaterial(self, edx, material, stage);
+  }
+}
+
+void __fastcall Hook_TodRenderListAddMesh(void* self, void* edx, void* mesh) {
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyBoxRenderDepth), 0, 0) > 0) {
+    InterlockedIncrement(const_cast<LONG*>(&g_todSkyMeshCommands));
+    RecordTodSkyRenderMesh(mesh);
+  }
+
+  if (g_origTodRenderListAddMesh != nullptr) {
+    g_origTodRenderListAddMesh(self, edx, mesh);
+  }
+}
+
+void __fastcall Hook_TodRenderMeshDraw(void* self, void* edx, void* mesh) {
+  const bool skyMesh = TodSkyRenderMeshRecorded(mesh);
+  if (skyMesh) {
+    const LONG executions = InterlockedIncrement(const_cast<LONG*>(&g_todSkyMeshDrawExecutions));
+    if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyMeshDrawFirstLogged), 1, 0) == 0) {
+      AppendTodSkyTextureRow(
+          "sky_mesh_draw_entered", nullptr, nullptr, nullptr, 0, false, executions, 0, 0);
+    }
+    InterlockedIncrement(const_cast<LONG*>(&g_todSkyMeshDrawDepth));
+  }
+
+  if (g_origTodRenderMeshDraw != nullptr) {
+    g_origTodRenderMeshDraw(self, edx, mesh);
+  }
+
+  if (skyMesh) {
+    InterlockedDecrement(const_cast<LONG*>(&g_todSkyMeshDrawDepth));
+  }
+}
+
+void InstallTodRenderListSetMaterialHook() {
+  if (!kHookTodSkyBoxRenderTextureScope) {
+    return;
+  }
+
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todRenderListSetMaterialHooked), 1, 0) != 0) {
+    return;
+  }
+
+  const uintptr_t moduleBase = TodModuleBase();
+  const uintptr_t target = moduleBase != 0 ? moduleBase + kTodRenderListSetMaterialRva : 0;
+  if (target == 0 || !IsCommittedMemoryRange(target, kTodRenderListSetMaterialPatchBytes, false)) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderListSetMaterialHooked), 0);
+    AppendTodSkyTextureRow("material_hook_unavailable", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  BYTE* targetBytes = reinterpret_cast<BYTE*>(target);
+  memcpy(g_todRenderListSetMaterialOriginalBytes, targetBytes, kTodRenderListSetMaterialPatchBytes);
+  if (targetBytes[0] != 0x56 || targetBytes[1] != 0x57 ||
+      targetBytes[2] != 0x8B || targetBytes[3] != 0xF9) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderListSetMaterialHooked), 0);
+    AppendTodSkyTextureRow("material_hook_unexpected_prologue", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  void* original = nullptr;
+  if (!InstallInlineJumpHook(
+          target,
+          reinterpret_cast<void*>(Hook_TodRenderListSetMaterial),
+          &original,
+          kTodRenderListSetMaterialPatchBytes,
+          "TOD RenderList::SetMaterial")) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderListSetMaterialHooked), 0);
+    AppendTodSkyTextureRow("material_hook_install_failed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  g_origTodRenderListSetMaterial =
+      reinterpret_cast<TodRenderListSetMaterialFn>(original);
+  AppendTodSkyTextureRow("material_hook_installed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+}
+
+void InstallTodRenderListAddMeshHook() {
+  if (!kHookTodSkyBoxRenderTextureScope) {
+    return;
+  }
+
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todRenderListAddMeshHooked), 1, 0) != 0) {
+    return;
+  }
+
+  const uintptr_t moduleBase = TodModuleBase();
+  const uintptr_t target = moduleBase != 0 ? moduleBase + kTodRenderListAddMeshRva : 0;
+  if (target == 0 || !IsCommittedMemoryRange(target, kTodRenderListAddMeshPatchBytes, false)) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderListAddMeshHooked), 0);
+    AppendTodSkyTextureRow("mesh_add_hook_unavailable", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  BYTE* targetBytes = reinterpret_cast<BYTE*>(target);
+  memcpy(g_todRenderListAddMeshOriginalBytes, targetBytes, kTodRenderListAddMeshPatchBytes);
+  if (targetBytes[0] != 0x8B || targetBytes[1] != 0x41 || targetBytes[2] != 0x20 ||
+      targetBytes[3] != 0x56 || targetBytes[4] != 0x8D) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderListAddMeshHooked), 0);
+    AppendTodSkyTextureRow("mesh_add_hook_unexpected_prologue", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  void* original = nullptr;
+  if (!InstallInlineJumpHook(
+          target,
+          reinterpret_cast<void*>(Hook_TodRenderListAddMesh),
+          &original,
+          kTodRenderListAddMeshPatchBytes,
+          "TOD RenderList::AddMesh")) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderListAddMeshHooked), 0);
+    AppendTodSkyTextureRow("mesh_add_hook_install_failed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  g_origTodRenderListAddMesh = reinterpret_cast<TodRenderListAddMeshFn>(original);
+  AppendTodSkyTextureRow("mesh_add_hook_installed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+}
+
+void InstallTodRenderMeshDrawHook() {
+  if (!kHookTodSkyBoxRenderTextureScope) {
+    return;
+  }
+
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todRenderMeshDrawHooked), 1, 0) != 0) {
+    return;
+  }
+
+  const uintptr_t moduleBase = TodModuleBase();
+  const uintptr_t target = moduleBase != 0 ? moduleBase + kTodRenderMeshDrawRva : 0;
+  if (target == 0 || !IsCommittedMemoryRange(target, kTodRenderMeshDrawPatchBytes, false)) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderMeshDrawHooked), 0);
+    AppendTodSkyTextureRow("mesh_draw_hook_unavailable", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  BYTE* targetBytes = reinterpret_cast<BYTE*>(target);
+  memcpy(g_todRenderMeshDrawOriginalBytes, targetBytes, kTodRenderMeshDrawPatchBytes);
+  if (targetBytes[0] != 0x83 || targetBytes[1] != 0xEC || targetBytes[2] != 0x34 ||
+      targetBytes[3] != 0x56 || targetBytes[4] != 0x57 ||
+      targetBytes[5] != 0x8B || targetBytes[6] != 0x7C) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderMeshDrawHooked), 0);
+    AppendTodSkyTextureRow("mesh_draw_hook_unexpected_prologue", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  void* original = nullptr;
+  if (!InstallInlineJumpHook(
+          target,
+          reinterpret_cast<void*>(Hook_TodRenderMeshDraw),
+          &original,
+          kTodRenderMeshDrawPatchBytes,
+          "TOD RenderMesh::Draw")) {
+    InterlockedExchange(const_cast<LONG*>(&g_todRenderMeshDrawHooked), 0);
+    AppendTodSkyTextureRow("mesh_draw_hook_install_failed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  g_origTodRenderMeshDraw = reinterpret_cast<TodRenderMeshDrawFn>(original);
+  AppendTodSkyTextureRow("mesh_draw_hook_installed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+}
+
+void InstallTodSkyBoxRenderHook() {
+  if (!kHookTodSkyBoxRenderTextureScope) {
+    return;
+  }
+
+  if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyBoxRenderHooked), 1, 0) != 0) {
+    return;
+  }
+
+  const uintptr_t moduleBase = TodModuleBase();
+  const uintptr_t target = moduleBase != 0 ? moduleBase + kTodSkyBoxRenderRva : 0;
+  if (target == 0 || !IsCommittedMemoryRange(target, kInlineHookPatchBytes, false)) {
+    InterlockedExchange(const_cast<LONG*>(&g_todSkyBoxRenderHooked), 0);
+    AppendTodSkyTextureRow("scope_hook_unavailable", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    Log("SkyBox::Render hook skipped: target unavailable");
+    return;
+  }
+
+  BYTE* targetBytes = reinterpret_cast<BYTE*>(target);
+  memcpy(g_todSkyBoxRenderOriginalBytes, targetBytes, kInlineHookPatchBytes);
+  if (targetBytes[0] != 0x81 || targetBytes[1] != 0xEC) {
+    InterlockedExchange(const_cast<LONG*>(&g_todSkyBoxRenderHooked), 0);
+    AppendTodSkyTextureRow("scope_hook_unexpected_prologue", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    Log(
+        "SkyBox::Render hook skipped: unexpected prologue %02X %02X",
+        targetBytes[0],
+        targetBytes[1]);
+    return;
+  }
+
+  void* original = nullptr;
+  if (!InstallInlineJumpHook(
+          target,
+          reinterpret_cast<void*>(Hook_TodSkyBoxRender),
+          &original,
+          kInlineHookPatchBytes,
+          "TOD SkyBox::Render")) {
+    InterlockedExchange(const_cast<LONG*>(&g_todSkyBoxRenderHooked), 0);
+    AppendTodSkyTextureRow("scope_hook_install_failed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
+    return;
+  }
+
+  g_origTodSkyBoxRender = reinterpret_cast<TodSkyBoxRenderFn>(original);
+  AppendTodSkyTextureRow("scope_hook_installed", nullptr, nullptr, nullptr, 0, false, -1, 0, 0);
 }
 
 void LogMatrixSample(const char* label, LONG count, const D3DMATRIX& matrix) {
@@ -1677,7 +3454,13 @@ HRESULT APIENTRY Hook_SetTexture(
   const HRESULT result = g_origSetTexture(self, stage, actualTexture);
 
   if (SUCCEEDED(result) && stage == 0) {
+    g_currentSourceTexture0 = texture;
     g_currentTexture0 = actualTexture;
+    QueueTodForcedTextureProbeTexture(texture, actualTexture);
+    if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyBoxRenderDepth), 0, 0) > 0) {
+      QueueTodSkyTexture(texture != nullptr ? texture : actualTexture, actualTexture, 0, 0, 0);
+      InterlockedIncrement(const_cast<LONG*>(&g_todSkyScopedTextureQueues));
+    }
   }
 
   const TextureInfo* boundInfo = FindTextureInfo(actualTexture);
@@ -1744,6 +3527,43 @@ HRESULT APIENTRY Hook_StretchRect(
   return result;
 }
 
+void InjectSunLight(IDirect3DDevice9* device) {
+  if (!kInjectSunLight || device == nullptr) {
+    return;
+  }
+  D3DLIGHT9 sun = {};
+  sun.Type = D3DLIGHT_DIRECTIONAL;
+  // Step 1 confirmed Remix ray-traces the injected light. Now a natural warm sun
+  // (moderate intensity). Direction is still the fixed test vector - step 2 wires it
+  // to the RE'd TOD sun-direction. D3DCOLORVALUE components may exceed 1.0 (intensity).
+  sun.Diffuse.r = 2.0f;
+  sun.Diffuse.g = 1.8f;
+  sun.Diffuse.b = 1.5f;
+  sun.Diffuse.a = 1.0f;
+  sun.Specular.r = 2.0f;
+  sun.Specular.g = 1.8f;
+  sun.Specular.b = 1.5f;
+  sun.Specular.a = 1.0f;
+  // Test direction: shining down and forward. Already unit length (0.8^2 + 0.6^2 = 1).
+  sun.Direction.x = 0.0f;
+  sun.Direction.y = -0.8f;
+  sun.Direction.z = 0.6f;
+  sun.Range = 100000.0f;
+
+  const HRESULT hrSet = device->SetLight(kSunLightIndex, &sun);
+  const HRESULT hrEnable = device->LightEnable(kSunLightIndex, TRUE);
+  const LONG n = InterlockedIncrement(const_cast<LONG*>(&g_sunLightInjections));
+  if (n <= 5 || (n % 600) == 0) {
+    Log("InjectSunLight #%ld: SetLight hr=0x%08lx LightEnable hr=0x%08lx dir=(%.2f,%.2f,%.2f)",
+        n,
+        static_cast<unsigned long>(hrSet),
+        static_cast<unsigned long>(hrEnable),
+        sun.Direction.x,
+        sun.Direction.y,
+        sun.Direction.z);
+  }
+}
+
 HRESULT APIENTRY Hook_Present(
     IDirect3DDevice9* self,
     const RECT* sourceRect,
@@ -1751,6 +3571,12 @@ HRESULT APIENTRY Hook_Present(
     HWND destWindowOverride,
     const RGNDATA* dirtyRegion) {
   const LONG count = InterlockedIncrement(const_cast<LONG*>(&g_presentCalls));
+  InjectSunLight(self);
+  ApplyTodCameraFarClipOverride();
+  ProcessQueuedTodSkyTextures();
+  RunTodSkyAssetLoadProbe();
+  RunTodTextureMapProbe();
+  ProcessQueuedTodForcedTextureProbeTextures();
   if (count <= 5 || (count % 60) == 0) {
     LogSummary("present");
   }
@@ -1790,6 +3616,116 @@ HRESULT APIENTRY Hook_SetTransform(
   return g_origSetTransform(self, state, matrix);
 }
 
+struct TodFogStateSlot {
+  D3DRENDERSTATETYPE state;
+  const char* name;
+  bool isFloat;
+  bool seen;
+  DWORD lastValue;
+  LONG lastSky;
+};
+
+TodFogStateSlot g_todFogSlots[] = {
+    {D3DRS_FOGENABLE, "FOGENABLE", false, false, 0, 0},
+    {D3DRS_FOGCOLOR, "FOGCOLOR", false, false, 0, 0},
+    {D3DRS_FOGTABLEMODE, "FOGTABLEMODE", false, false, 0, 0},
+    {D3DRS_FOGSTART, "FOGSTART", true, false, 0, 0},
+    {D3DRS_FOGEND, "FOGEND", true, false, 0, 0},
+    {D3DRS_FOGDENSITY, "FOGDENSITY", true, false, 0, 0},
+    {D3DRS_RANGEFOGENABLE, "RANGEFOGENABLE", false, false, 0, 0},
+    {D3DRS_FOGVERTEXMODE, "FOGVERTEXMODE", false, false, 0, 0},
+};
+
+volatile LONG g_todFogStateRows = 0;
+
+// Records each distinct fixed-function fog render-state TOD submits, noting
+// whether it happens inside SkyBox::Render scope. Deduped on changed value so
+// the file stays small. Diagnostic only; behavior is unchanged.
+void LogTodFogState(D3DRENDERSTATETYPE state, DWORD value) {
+  if (!kEnableTodFogStateLog) {
+    return;
+  }
+  TodFogStateSlot* slot = nullptr;
+  for (TodFogStateSlot& candidate : g_todFogSlots) {
+    if (candidate.state == state) {
+      slot = &candidate;
+      break;
+    }
+  }
+  if (slot == nullptr) {
+    return;
+  }
+
+  const LONG sky =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyBoxRenderDepth), 0, 0) > 0 ? 1 : 0;
+  if (slot->seen && slot->lastValue == value && slot->lastSky == sky) {
+    return;
+  }
+  slot->seen = true;
+  slot->lastValue = value;
+  slot->lastSky = sky;
+
+  const LONG row = InterlockedIncrement(const_cast<LONG*>(&g_todFogStateRows));
+  if (row > 20000) {
+    return;
+  }
+
+  char decoded[128] = {};
+  if (state == D3DRS_FOGCOLOR) {
+    snprintf(
+        decoded,
+        sizeof(decoded),
+        "A=%lu R=%lu G=%lu B=%lu",
+        (value >> 24) & 0xFF,
+        (value >> 16) & 0xFF,
+        (value >> 8) & 0xFF,
+        value & 0xFF);
+  } else if (slot->isFloat) {
+    float f = 0.0f;
+    memcpy(&f, &value, sizeof(f));
+    snprintf(decoded, sizeof(decoded), "%.4f", f);
+  } else {
+    snprintf(decoded, sizeof(decoded), "%lu", static_cast<unsigned long>(value));
+  }
+
+  char line[512] = {};
+  snprintf(
+      line,
+      sizeof(line),
+      "%ld\t%s\t0x%08lx\t%s\t%ld\t%ld\r\n",
+      row,
+      slot->name,
+      static_cast<unsigned long>(value),
+      decoded,
+      sky,
+      InterlockedCompareExchange(const_cast<LONG*>(&g_setRenderStateCalls), 0, 0));
+
+  const char* path =
+      g_todFogStateLogPath[0] != '\0' ? g_todFogStateLogPath : "rtx-remix\\logs\\tod-fog-state.tsv";
+  const bool newFile = GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES;
+
+  LockLog();
+  EnsureLogDirectory();
+  HANDLE file = CreateFileA(
+      path,
+      FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE,
+      nullptr,
+      OPEN_ALWAYS,
+      FILE_ATTRIBUTE_NORMAL,
+      nullptr);
+  if (file != INVALID_HANDLE_VALUE) {
+    DWORD written = 0;
+    if (newFile) {
+      const char* header = "row\tfogState\trawValue\tdecoded\tskyScope\tsetRenderStateCall\r\n";
+      WriteFile(file, header, static_cast<DWORD>(strlen(header)), &written, nullptr);
+    }
+    WriteFile(file, line, static_cast<DWORD>(strlen(line)), &written, nullptr);
+    CloseHandle(file);
+  }
+  UnlockLog();
+}
+
 HRESULT APIENTRY Hook_SetRenderState(
     IDirect3DDevice9* self,
     D3DRENDERSTATETYPE state,
@@ -1797,6 +3733,7 @@ HRESULT APIENTRY Hook_SetRenderState(
   const HRESULT result = g_origSetRenderState(self, state, value);
   if (SUCCEEDED(result)) {
     InterlockedIncrement(const_cast<LONG*>(&g_setRenderStateCalls));
+    LogTodFogState(state, value);
     switch (state) {
       case D3DRS_ZENABLE:
         InterlockedExchange(const_cast<LONG*>(&g_zEnable), value != 0 ? 1 : 0);
@@ -1978,6 +3915,42 @@ HRESULT APIENTRY Hook_DrawIndexedPrimitive(
 
   const bool resent = ResendCameraForDraw(self, preTransformed || layout.shaderActive);
   IDirect3DBaseTexture9* restoreTexture = BindPreTransformedA8CopyForDraw(self, layout);
+  const bool todSkyMeshExecution =
+      InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyMeshDrawDepth), 0, 0) > 0;
+  const bool todSkyDraw =
+      todSkyMeshExecution ||
+      (primitiveType == D3DPT_TRIANGLELIST && CurrentDrawUsesTodSkyMesh(self, layout));
+  D3DVIEWPORT9 savedSkyViewport = {};
+  const bool skyViewportMarked =
+      todSkyDraw && ApplyTodSkyViewportMarker(self, &savedSkyViewport);
+  if (todSkyDraw) {
+    const LONG skyDraws = InterlockedIncrement(const_cast<LONG*>(&g_todSkyDraws));
+    QueueTodSkyTextureForDraw(skyDraws, primitiveCount, numVertices);
+    if (InterlockedCompareExchange(const_cast<LONG*>(&g_todSkyViewportFirstLogged), 1, 0) == 0) {
+      IDirect3DBaseTexture9* hashTexture =
+          g_currentSourceTexture0 != nullptr ? g_currentSourceTexture0 : g_currentTexture0;
+      const TextureInfo* info = FindTextureInfo(hashTexture);
+      AppendTodSkyTextureRow(
+          skyViewportMarked ? "sky_viewport_marked" : "sky_viewport_not_marked",
+          g_currentSourceTexture0,
+          g_currentTexture0,
+          info,
+          0,
+          false,
+          skyDraws,
+          primitiveCount,
+          numVertices);
+    }
+    if (skyDraws <= 10 || (skyDraws % 300) == 0) {
+      Log(
+          "TOD SkyBox indexed draw #%ld: primCount=%u numVertices=%u viewportMarked=%d meshScope=%d",
+          skyDraws,
+          primitiveCount,
+          numVertices,
+          skyViewportMarked ? 1 : 0,
+          todSkyMeshExecution ? 1 : 0);
+    }
+  }
   LogDrawSample("DrawIndexedPrimitive", count, primitiveType, primitiveCount, numVertices, layout, resent);
 
   const HRESULT result = g_origDrawIndexedPrimitive(
@@ -1988,6 +3961,9 @@ HRESULT APIENTRY Hook_DrawIndexedPrimitive(
       numVertices,
       startIndex,
       primitiveCount);
+  if (skyViewportMarked) {
+    self->SetViewport(&savedSkyViewport);
+  }
   RestoreTexture0AfterDraw(self, restoreTexture);
   MarkWorldDrawIfPrimary(layout);
   return result;
@@ -2062,6 +4038,11 @@ void HookDevice(IDirect3DDevice9* device) {
   if (InterlockedExchange(const_cast<LONG*>(&g_deviceHooked), 1) == 0) {
     Log("installing IDirect3DDevice9 hooks on device=%p", device);
   }
+
+  InstallTodSkyBoxRenderHook();
+  InstallTodRenderListSetMaterialHook();
+  InstallTodRenderListAddMeshHook();
+  InstallTodRenderMeshDrawHook();
 
   HookVtableSlot(device, kDevicePresentIndex, Hook_Present, &g_origPresent, "IDirect3DDevice9::Present");
   HookVtableSlot(
