@@ -1,4 +1,0 @@
-2026-06-01 03:16:47.053 Direct3DCreate9 probe succeeded: d3d9=00D45948 module=6EB20000
-2026-06-01 03:16:47.053 IDirect3D9::CreateDevice hook installed: slot=6EBC8404 original=6EB68F70 hook=6FBC1270
-2026-06-01 03:16:47.053 factory hook ready
-2026-06-01 03:19:32.443 TODCameraResend ASI loaded; waiting for d3d9.dll

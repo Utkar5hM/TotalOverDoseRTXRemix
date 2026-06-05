@@ -1,0 +1,8 @@
+*.log
+*.dxvk-cache
+imgui.ini
+metrics.txt
+scripts/rtx-remix/logs/
+scripts/rtx-remix/captures/
+rtx-remix/logs/
+rtx-remix/captures/
