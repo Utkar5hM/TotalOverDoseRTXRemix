@@ -1,67 +1,67 @@
-# Total Overdose RTX Remix Runtime Package
+# Total Overdose — RTX Remix
 
-This is the use-only RTX Remix package for Total Overdose. It contains the files needed to run the current Remix config, ASI fixes, lighting placeholder, and Mission 2 full-PBR upscaled texture replacements.
+This is a **reverse-engineering project to make RTX Remix run well on the 2004 Direct3D
+game *Total Overdose: A Gunslinger's Tale in Mexico***. The game is fixed-function D3D8
+(wrapped to D3D9) with baked vertex lighting, so a lot of work went into getting Remix to
+path-trace it correctly — valid texture hashes, sky/HUD handling, fog/atmosphere, render
+distance, and lighting. The `re_docs/` folder documents that process in detail, and
+`tools/` holds the source of the custom compatibility shim.
+
+It is a work in progress, not an official release.
 
 ## Requirements
 
-- A legal installed copy of Total Overdose. This package does not include game executables, archives, audio, videos, or other game data.
-- Windows with an RTX Remix-capable GPU/driver setup.
+- **The GOG release of Total Overdose** —
+  <https://www.gog.com/en/game/total_overdose_a_gunslingers_tale_in_mexico>.
+  This matters: the compatibility shim's TOD-specific hooks (e.g. the skybox-render marker
+  used for sky handling) target function addresses found in the **GOG `TOD.exe` build** via
+  Ghidra. Other releases (retail/Steam/cracked) have different binaries and are not
+  supported — sky/lighting handling will misbehave.
+- A legal copy of the game. **No game files** (executables, `*.naz` archives, audio,
+  video) are included or redistributed here.
+- Windows with an RTX Remix-capable NVIDIA GPU + driver.
 
-## Layout
+## What's in here
 
-- `d3d8to9.dll`, `d3d9.dll`, `NvRemixLauncher32.exe` - RTX Remix/D3D8 runtime pieces.
-- `dinput8.dll` - ASI loader used by the script plugins.
-- `scripts/rtx.conf` - the single RTX Remix config for this package.
-- `scripts/dxvk.conf` - DXVK option layer; kept separate because Remix/DXVK parses it as a different config file.
-- `scripts/TODCameraResend.ini` - runtime-tunable injected sun direction and color.
-- `scripts/` - script-side camera resend ASI, sun tuning INI, and widescreen ASI.
-- `scripts/rtx-remix/mods/mission2/` - the active RTX Remix Mission 2 mod.
-- `scripts/rtx-remix/mods/mission2/mod.usda` - Remix mod entry layer.
-- `scripts/rtx-remix/mods/mission2/ai_textures.usda` - material-to-texture replacement layer.
-- `scripts/rtx-remix/mods/mission2/lighting.usda` - placeholder layer for future authored lighting.
-- `scripts/rtx-remix/mods/mission2/assets/` - DDS texture replacements referenced by `ai_textures.usda`.
-
-Not included: Toolkit captures, logs, source PNGs, authoring `deps` links, reverse-engineering notes, texture-generation scripts, duplicate root config files, or base game files.
-
-## Texture State
-
-Mission 2 has full generated PBR replacement wiring:
-
-- Diffuse, normal, and roughness replacement DDS files are included.
-- Diffuse replacements preserve original alpha where the original captured texture had alpha, avoiding broken foliage and cutout materials.
-- The main character shirt material is excluded because the upscale looked worse in-game.
-Included referenced DDS files: 2802.
-Texture asset size: 0.55 GB.
-
-## Lighting State
-
-The visible TOD sky/lens-flare sun is not a physical RTX light. Current shadow-casting sunlight comes from `scripts/TODCameraResend.asi`, which injects an enabled D3D9 directional light that Remix converts to a distant light. Direction and color are tuned from `scripts/TODCameraResend.ini`; the current test flips the old Z direction and uses stronger direct sun with lower ambient fill for darker shadows. `scripts/rtx.conf` must keep game directional lights enabled; disabling them also suppresses the injected ASI sun. `lighting.usda` is currently a placeholder for future Toolkit-authored lights.
+| Path | What it is |
+|------|------------|
+| `.trex/` | The bundled RTX Remix runtime (path tracer). |
+| `scripts/TODCameraResend.asi` | The compatibility shim (D3D9 vtable hook). Camera resend, render-target redirect, managed-texture shadowing for valid Remix hashes, sky-draw marking. |
+| `scripts/TODCameraResend.ini` | Runtime-tunable settings for the shim. Currently the `[Sun]` section is inactive (see Lighting). |
+| `scripts/rtx.conf` | The RTX Remix config for this game (the active one — Remix reads `scripts/`). |
+| `scripts/dxvk.conf` | DXVK option layer (parsed separately from `rtx.conf`). |
+| `scripts/TotalOverdose.WidescreenFix.asi/.ini` | Widescreen fix plugin. |
+| `scripts/rtx-remix/mods/mission2/` | Mission 2 AI-upscaled PBR texture mod (diffuse/normal/roughness). |
+| `d3d9.dll`, `d3d8to9.dll`, `dinput8.dll`, `NvRemixLauncher32.exe` | Bridge, D3D8→9 wrapper, ASI loader, launcher. |
+| `tools/tod_camera_resend_asi/` | **Source** of the shim (`TODCameraResend.cpp`) + `build.bat`. |
+| `re_docs/` | Reverse-engineering notes and the chronological runtime debug log. |
 
 ## Install
 
-Copy this package over a Total Overdose install so the files land next to `TOD.exe`.
+Copy the contents of this package into your GOG Total Overdose install so the files land
+next to `TOD.exe` (merging the `.trex/` and `scripts/` folders). The RTX Remix runtime is
+bundled, so nothing else is needed. Launch via `NvRemixLauncher32.exe` (or the GOG
+launcher if it's wired to it).
 
-Expected live paths after install:
+## Lighting / shadows
 
-- `TOD.exe`
-- `d3d8to9.dll`
-- `d3d9.dll`
-- `dinput8.dll`
-- `scripts/rtx.conf`
-- `scripts/dxvk.conf`
-- `scripts/TODCameraResend.asi`
-- `scripts/TODCameraResend.ini`
-- `scripts/TotalOverdose.WidescreenFix.asi`
-- `scripts/rtx-remix/mods/mission2/mod.usda`
-- `scripts/rtx-remix/mods/mission2/ai_textures.usda`
-- `scripts/rtx-remix/mods/mission2/lighting.usda`
-- `scripts/rtx-remix/mods/mission2/assets/textures/<hash>/<hash>_diffuse.dds`
-- `scripts/rtx-remix/mods/mission2/assets/textures/<hash>/<hash>_normal_dx.dds`
-- `scripts/rtx-remix/mods/mission2/assets/textures/<hash>/<hash>_roughness.dds`
+TOD has **no real sun** — lighting is baked into vertex colors and the on-screen sun is a
+skybox-painted glow plus a 2D lens-flare billboard. Sun **shadows are cast by the sky /
+skybox through Remix's environment probe**, which works correctly on its own.
 
-## Notes
+An earlier approach had the shim inject a D3D9 directional "sun" light for Remix to
+ray-trace. Even when auto-aimed at TOD's lens-flare sun, it produced a **second, conflicting
+shadow** — TOD's lens-flare sun and the skybox sun sit in different directions — so it is
+**disabled** (`kInjectSunLight = false`). The injection + auto-aim machinery remains in the
+source (gated off) for anyone who wants to revisit a crisp directional sun later (which
+would also need `rtx.skyBrightness` lowered so the two shadows don't double up).
 
-The old local authoring path `C:\GOG Games\todremix\mission2` is not required for runtime use. The mod is packaged directly in `scripts/rtx-remix/mods/mission2` so no symlink is needed.
+Shadow depth is tuned with `rtx.localtonemap.shadows` (the local tonemapper is active;
+lower = darker shadows) — adjustable live in the Remix menu (Alt+X).
 
+## Building the shim (optional)
 
-
+`tools/tod_camera_resend_asi/build.bat` builds `TODCameraResend.asi` with MSVC (`/W4`
+clean). It includes an xxHash header from a dxvk-remix checkout (`../../third_party/...`);
+point that include at a local dxvk-remix clone if you rebuild. The prebuilt `.asi` in
+`scripts/` is ready to use, so building is only needed to modify the shim.
