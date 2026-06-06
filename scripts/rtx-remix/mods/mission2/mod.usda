@@ -5,7 +5,8 @@
         string lightspeed_layer_type = "replacement"
     }
     subLayers = [
-        @./ai_textures.usda@
+        @./ai_textures.usda@,
+        @./lighting.usda@
     ]
     timeCodesPerSecond = 24
     upAxis = "Y"
@@ -384,30 +385,5 @@ over "RootNode"
             }
         }
 
-        over "mesh_223067D093649DAF"
-        {
-            def SphereLight "SphereLight" (
-                prepend apiSchemas = ["ShapingAPI"]
-            )
-            {
-                float3[] extent = [(-5, -5, -5), (5, 5, 5)]
-                color3f inputs:color = (0.996139, 0.7569027, 0.63075984)
-                float inputs:colorTemperature = 3120
-                bool inputs:enableColorTemperature = 1
-                float inputs:exposure = 0
-                float inputs:intensity = 0.4700791
-                float inputs:radius = 5
-                float inputs:shaping:cone:angle = 180
-                float inputs:shaping:cone:softness
-                float inputs:shaping:focus
-                color3f inputs:shaping:focusTint
-                asset inputs:shaping:ies:file
-                double3 xformOp:rotateXYZ = (0, 0, 0)
-                double3 xformOp:scale = (1, 1, 1)
-                double3 xformOp:translate = (-2.2737367544323206e-12, 2.973254467160749, -1.1368683772161603e-12)
-                uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ", "xformOp:scale"]
-            }
-        }
     }
 }
-
