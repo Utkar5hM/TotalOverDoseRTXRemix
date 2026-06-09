@@ -6,3 +6,6 @@ scripts/rtx-remix/logs/
 scripts/rtx-remix/captures/
 rtx-remix/logs/
 rtx-remix/captures/
+
+# Generated texture-pipeline intermediates; Remix uses the DDS outputs.
+scripts/rtx-remix/mods/mission2/assets/textures/**/*.png
